@@ -742,7 +742,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         # NOTE: was `self.cache` — an AttributeError on every call (this client
         # only has `_cache`). Caught by the brackets part-1 test suite;
-        # _modify_order had never been exercised before.
+        # _modify_order had never been exercised before. (Upstream fixed the
+        # same bug independently in 83dca1b.)
         order = self._cache.order(client_order_id)
         if order is None:
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
