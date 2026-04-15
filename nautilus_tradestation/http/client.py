@@ -49,10 +49,10 @@ class TradeStationHttpClient:
         base_url: str | None = None,
     ) -> None:
         self.client_id = client_id or os.getenv("TRADESTATION_CLIENT_ID")
-        self.client_secret = client_secret or os.getenv("TRADESTATION_CLIENT_SECRET")
-        self.refresh_token = refresh_token or os.getenv("TRADESTATION_REFRESH_TOKEN")
+        self._client_secret = client_secret or os.getenv("TRADESTATION_CLIENT_SECRET")
+        self._refresh_token = refresh_token or os.getenv("TRADESTATION_REFRESH_TOKEN")
 
-        if not all([self.client_id, self.client_secret, self.refresh_token]):
+        if not all([self.client_id, self._client_secret, self._refresh_token]):
             raise ValueError(
                 "TradeStation credentials required. "
                 "Provide via parameters or set environment variables: "
@@ -67,7 +67,7 @@ class TradeStationHttpClient:
         else:
             self.base_url = "https://api.tradestation.com/v3"
 
-        self.access_token: str | None = None
+        self._access_token: str | None = None
         self.token_expiry: datetime | None = None
         self._auth_lock = asyncio.Lock()
 
@@ -79,6 +79,11 @@ class TradeStationHttpClient:
             timeout=30.0,
             limits=httpx.Limits(keepalive_expiry=1200),
         )
+
+    @property
+    def access_token(self) -> str | None:
+        """Current OAuth access token (read-only)."""
+        return self._access_token
 
     async def _ensure_authenticated(self) -> None:
         await self.get_access_token(force_refresh=False)
@@ -111,24 +116,24 @@ class TradeStationHttpClient:
         data = {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
+            "client_secret": self._client_secret,
+            "refresh_token": self._refresh_token,
         }
         response = await self._httpx.post(self.auth_url, data=data)
         if response.status_code != 200:
             _log.debug(f"Auth failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"TradeStation authentication failed: HTTP {response.status_code}")
         token_data = response.json()
-        self.access_token = token_data["access_token"]
+        self._access_token = token_data["access_token"]
         expires_in = token_data.get("expires_in", 1200)
         self.token_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
         if token_data.get("refresh_token"):
-            self.refresh_token = token_data["refresh_token"]
+            self._refresh_token = token_data["refresh_token"]
 
     async def _get_headers(self) -> dict[str, str]:
         await self._ensure_authenticated()
         return {
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",
         }
 
@@ -585,5 +590,9 @@ class TradeStationHttpClient:
         return data.get("Quotes", []) if isinstance(data, dict) else data
 
     async def close(self) -> None:
-        """Close the underlying HTTP client and release connections."""
+        """Close the underlying HTTP client and clear credentials from memory."""
+        self._access_token = None
+        self._client_secret = None
+        self._refresh_token = None
+        self.token_expiry = None
         await self._httpx.aclose()
