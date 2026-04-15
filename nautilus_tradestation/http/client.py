@@ -5,6 +5,7 @@ Uses ``httpx.AsyncClient`` for all API calls so callers can ``await`` them
 directly without ``asyncio.to_thread`` wrappers.
 """
 
+import logging
 import os
 import asyncio
 from datetime import datetime
@@ -14,6 +15,8 @@ from typing import Any
 import httpx
 
 from nautilus_tradestation.common.enums import TradeStationBarUnit
+
+_log = logging.getLogger(__name__)
 
 
 class TradeStationHttpClient:
@@ -113,7 +116,8 @@ class TradeStationHttpClient:
         }
         response = await self._httpx.post(self.auth_url, data=data)
         if response.status_code != 200:
-            raise Exception(f"TradeStation authentication failed: {response.text}")
+            _log.debug(f"Auth failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"TradeStation authentication failed: HTTP {response.status_code}")
         token_data = response.json()
         self.access_token = token_data["access_token"]
         expires_in = token_data.get("expires_in", 1200)
@@ -178,7 +182,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), params=params
         )
         if response.status_code != 200:
-            raise Exception(f"TradeStation API request failed: {response.text}")
+            _log.debug(f"Get bars failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"TradeStation get bars failed: HTTP {response.status_code}")
         return response.json().get("Bars", [])
 
     async def search_symbols(
@@ -210,7 +215,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), params=params
         )
         if response.status_code != 200:
-            raise Exception(f"Symbol search failed: {response.text}")
+            _log.debug(f"Symbol search failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Symbol search failed: HTTP {response.status_code}")
         return response.json()
 
     async def get_symbol_details(self, symbol: str) -> dict[str, Any]:
@@ -231,7 +237,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/marketdata/symbols/{symbol}"
         response = await self._httpx.get(url, headers=await self._get_headers())
         if response.status_code != 200:
-            raise Exception(f"Get symbol details failed: {response.text}")
+            _log.debug(f"Get symbol details failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get symbol details failed: HTTP {response.status_code}")
         data = response.json()
         if isinstance(data, dict) and "Symbols" in data:
             symbols = data.get("Symbols", [])
@@ -255,7 +262,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/brokerage/accounts"
         response = await self._httpx.get(url, headers=await self._get_headers())
         if response.status_code != 200:
-            raise Exception(f"Get accounts failed: {response.text}")
+            _log.debug(f"Get accounts failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get accounts failed: HTTP {response.status_code}")
         data = response.json()
         return data.get("Accounts", []) if isinstance(data, dict) else data
 
@@ -277,7 +285,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/balances"
         response = await self._httpx.get(url, headers=await self._get_headers())
         if response.status_code != 200:
-            raise Exception(f"Get balances failed: {response.text}")
+            _log.debug(f"Get balances failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get balances failed: HTTP {response.status_code}")
         data = response.json()
         if isinstance(data, dict) and "Balances" in data:
             balances = data.get("Balances", [])
@@ -302,7 +311,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/positions"
         response = await self._httpx.get(url, headers=await self._get_headers())
         if response.status_code != 200:
-            raise Exception(f"Get positions failed: {response.text}")
+            _log.debug(f"Get positions failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get positions failed: HTTP {response.status_code}")
         data = response.json()
         return data.get("Positions", []) if isinstance(data, dict) else data
 
@@ -363,7 +373,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), json=order_data
         )
         if response.status_code not in (200, 201):
-            raise Exception(f"Place order failed: {response.text}")
+            _log.debug(f"Place order failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Place order failed (HTTP {response.status_code}): {response.text[:200]}")
         return response.json()
 
     async def replace_order(
@@ -415,7 +426,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), json=order_data
         )
         if response.status_code not in (200, 201):
-            raise Exception(f"Replace order failed: {response.text}")
+            _log.debug(f"Replace order failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Replace order failed (HTTP {response.status_code}): {response.text[:200]}")
         return response.json()
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
@@ -436,7 +448,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/orderexecution/orders/{order_id}"
         response = await self._httpx.delete(url, headers=await self._get_headers())
         if response.status_code not in (200, 204):
-            raise Exception(f"Cancel order failed: {response.text}")
+            _log.debug(f"Cancel order failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Cancel order failed (HTTP {response.status_code}): {response.text[:200]}")
         try:
             return response.json()
         except Exception:
@@ -471,7 +484,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), params=params
         )
         if response.status_code != 200:
-            raise Exception(f"Get orders failed: {response.text}")
+            _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get orders failed: HTTP {response.status_code}")
         data = response.json()
         return data.get("Orders", []) if isinstance(data, dict) else data
 
@@ -542,7 +556,8 @@ class TradeStationHttpClient:
             url, headers=await self._get_headers(), json=payload
         )
         if response.status_code not in (200, 201):
-            raise Exception(f"Place order group failed: {response.text}")
+            _log.debug(f"Place order group failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Place order group failed (HTTP {response.status_code}): {response.text[:200]}")
         return response.json()
 
     async def get_quotes(self, symbols: str) -> list[dict[str, Any]]:
@@ -564,7 +579,8 @@ class TradeStationHttpClient:
         url = f"{self.base_url}/marketdata/quotes/{symbols}"
         response = await self._httpx.get(url, headers=await self._get_headers())
         if response.status_code != 200:
-            raise Exception(f"Get quotes failed: {response.text}")
+            _log.debug(f"Get quotes failed (HTTP {response.status_code}): {response.text[:500]}")
+            raise Exception(f"Get quotes failed: HTTP {response.status_code}")
         data = response.json()
         return data.get("Quotes", []) if isinstance(data, dict) else data
 
