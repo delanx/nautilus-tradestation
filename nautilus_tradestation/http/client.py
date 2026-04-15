@@ -11,12 +11,18 @@ import asyncio
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from nautilus_tradestation.common.enums import TradeStationBarUnit
 
 _log = logging.getLogger(__name__)
+
+_ALLOWED_HOSTS = frozenset({
+    "api.tradestation.com",
+    "sim-api.tradestation.com",
+})
 
 
 class TradeStationHttpClient:
@@ -36,7 +42,11 @@ class TradeStationHttpClient:
     use_sandbox : bool, default False
         If ``True``, use the TradeStation sandbox/simulation API.
     base_url : str, optional
-        Override the default API base URL.
+        Override the default API base URL. Must be HTTPS to a known
+        TradeStation domain unless ``allow_custom_base_url`` is set.
+    allow_custom_base_url : bool, default False
+        If ``True``, skip hostname validation on ``base_url``. Use for
+        local proxies or mock servers only.
 
     """
 
@@ -47,6 +57,7 @@ class TradeStationHttpClient:
         refresh_token: str | None = None,
         use_sandbox: bool = False,
         base_url: str | None = None,
+        allow_custom_base_url: bool = False,
     ) -> None:
         self.client_id = client_id or os.getenv("TRADESTATION_CLIENT_ID")
         self._client_secret = client_secret or os.getenv("TRADESTATION_CLIENT_SECRET")
@@ -61,6 +72,15 @@ class TradeStationHttpClient:
 
         self.auth_url = "https://signin.tradestation.com/oauth/token"
         if base_url:
+            if not allow_custom_base_url:
+                parsed = urlparse(base_url)
+                if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_HOSTS:
+                    raise ValueError(
+                        f"base_url must be HTTPS to a TradeStation domain "
+                        f"({', '.join(sorted(_ALLOWED_HOSTS))}). "
+                        f"Got: {base_url}  "
+                        f"Set allow_custom_base_url=True to override.",
+                    )
             self.base_url = base_url
         elif use_sandbox:
             self.base_url = "https://sim-api.tradestation.com/v3"
