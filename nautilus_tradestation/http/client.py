@@ -5,9 +5,10 @@ Uses ``httpx.AsyncClient`` for all API calls so callers can ``await`` them
 directly without ``asyncio.to_thread`` wrappers.
 """
 
+import asyncio
 import logging
 import os
-import asyncio
+import time
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
@@ -58,6 +59,9 @@ class TradeStationHttpClient:
         use_sandbox: bool = False,
         base_url: str | None = None,
         allow_custom_base_url: bool = False,
+        max_retries: int = 3,
+        retry_delay_initial_ms: int = 1000,
+        retry_delay_max_ms: int = 60_000,
     ) -> None:
         self.client_id = client_id or os.getenv("TRADESTATION_CLIENT_ID")
         self._client_secret = client_secret or os.getenv("TRADESTATION_CLIENT_SECRET")
@@ -90,6 +94,10 @@ class TradeStationHttpClient:
         self._access_token: str | None = None
         self.token_expiry: datetime | None = None
         self._auth_lock = asyncio.Lock()
+
+        self._max_retries: int = max(1, max_retries)
+        self._retry_delay_initial_s: float = retry_delay_initial_ms / 1000.0
+        self._retry_delay_max_s: float = retry_delay_max_ms / 1000.0
 
         # Persistent async HTTP client — reuses TCP connections across requests.
         # Closed in close(); callers should not share instances across event loops.
@@ -149,6 +157,7 @@ class TradeStationHttpClient:
         self.token_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
         if token_data.get("refresh_token"):
             self._refresh_token = token_data["refresh_token"]
+            _log.debug("OAuth refresh token rotated — updated in memory")
 
     async def _get_headers(self) -> dict[str, str]:
         await self._ensure_authenticated()
@@ -156,6 +165,41 @@ class TradeStationHttpClient:
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",
         }
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Send an authenticated request, retrying on HTTP 429.
+
+        Reads Retry-After on 429 and sleeps accordingly. Also proactively
+        sleeps when X-RateLimit-Remaining drops below 5 to avoid hitting
+        the wall. Retries up to self._max_retries times total.
+        """
+        httpx_fn = getattr(self._httpx, method.lower())
+        resp: httpx.Response | None = None
+        for attempt in range(self._max_retries):
+            kwargs["headers"] = await self._get_headers()
+            resp = await httpx_fn(url, **kwargs)
+            if resp.status_code == 429:
+                retry_after = float(
+                    resp.headers.get("Retry-After", self._retry_delay_initial_s)
+                )
+                retry_after = min(retry_after, self._retry_delay_max_s)
+                _log.warning(
+                    f"Rate limited (429) on {url} — sleeping {retry_after:.1f}s "
+                    f"(attempt {attempt + 1}/{self._max_retries})"
+                )
+                await asyncio.sleep(retry_after)
+                continue
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) < 5:
+                reset_epoch = int(resp.headers.get("X-RateLimit-Reset", 0))
+                sleep_secs = max(0.1, reset_epoch - time.time()) + 0.1
+                _log.warning(
+                    f"Rate limit nearly exhausted ({remaining} remaining) — "
+                    f"sleeping {sleep_secs:.1f}s"
+                )
+                await asyncio.sleep(sleep_secs)
+            return resp
+        return resp  # type: ignore[return-value]  # exhausted retries
 
     async def get_bars(
         self,
@@ -203,9 +247,7 @@ class TradeStationHttpClient:
         if last_date:
             params["lastdate"] = last_date
 
-        response = await self._httpx.get(
-            url, headers=await self._get_headers(), params=params
-        )
+        response = await self._request("GET", url, params=params)
         if response.status_code != 200:
             _log.debug(f"Get bars failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"TradeStation get bars failed: HTTP {response.status_code}")
@@ -236,9 +278,7 @@ class TradeStationHttpClient:
         params = {}
         if category:
             params["category"] = category
-        response = await self._httpx.get(
-            url, headers=await self._get_headers(), params=params
-        )
+        response = await self._request("GET", url, params=params)
         if response.status_code != 200:
             _log.debug(f"Symbol search failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Symbol search failed: HTTP {response.status_code}")
@@ -260,7 +300,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/marketdata/symbols/{symbol}"
-        response = await self._httpx.get(url, headers=await self._get_headers())
+        response = await self._request("GET", url)
         if response.status_code != 200:
             _log.debug(f"Get symbol details failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get symbol details failed: HTTP {response.status_code}")
@@ -285,7 +325,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/brokerage/accounts"
-        response = await self._httpx.get(url, headers=await self._get_headers())
+        response = await self._request("GET", url)
         if response.status_code != 200:
             _log.debug(f"Get accounts failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get accounts failed: HTTP {response.status_code}")
@@ -308,7 +348,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/balances"
-        response = await self._httpx.get(url, headers=await self._get_headers())
+        response = await self._request("GET", url)
         if response.status_code != 200:
             _log.debug(f"Get balances failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get balances failed: HTTP {response.status_code}")
@@ -334,7 +374,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/positions"
-        response = await self._httpx.get(url, headers=await self._get_headers())
+        response = await self._request("GET", url)
         if response.status_code != 200:
             _log.debug(f"Get positions failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get positions failed: HTTP {response.status_code}")
@@ -394,9 +434,7 @@ class TradeStationHttpClient:
         if order_type in ("StopMarket", "StopLimit") and stop_price:
             order_data["StopPrice"] = stop_price
 
-        response = await self._httpx.post(
-            url, headers=await self._get_headers(), json=order_data
-        )
+        response = await self._request("POST", url, json=order_data)
         if response.status_code not in (200, 201):
             _log.debug(f"Place order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Place order failed (HTTP {response.status_code}): {response.text[:200]}")
@@ -447,9 +485,7 @@ class TradeStationHttpClient:
         if order_type in ("StopMarket", "StopLimit") and stop_price:
             order_data["StopPrice"] = stop_price
 
-        response = await self._httpx.put(
-            url, headers=await self._get_headers(), json=order_data
-        )
+        response = await self._request("PUT", url, json=order_data)
         if response.status_code not in (200, 201):
             _log.debug(f"Replace order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Replace order failed (HTTP {response.status_code}): {response.text[:200]}")
@@ -471,7 +507,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/orderexecution/orders/{order_id}"
-        response = await self._httpx.delete(url, headers=await self._get_headers())
+        response = await self._request("DELETE", url)
         if response.status_code not in (200, 204):
             _log.debug(f"Cancel order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Cancel order failed (HTTP {response.status_code}): {response.text[:200]}")
@@ -505,9 +541,7 @@ class TradeStationHttpClient:
         params: dict[str, str] = {}
         if since:
             params["since"] = since
-        response = await self._httpx.get(
-            url, headers=await self._get_headers(), params=params
-        )
+        response = await self._request("GET", url, params=params)
         if response.status_code != 200:
             _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get orders failed: HTTP {response.status_code}")
@@ -577,9 +611,7 @@ class TradeStationHttpClient:
         """
         url = f"{self.base_url}/orderexecution/ordergroups"
         payload = {"Type": group_type, "Orders": orders}
-        response = await self._httpx.post(
-            url, headers=await self._get_headers(), json=payload
-        )
+        response = await self._request("POST", url, json=payload)
         if response.status_code not in (200, 201):
             _log.debug(f"Place order group failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Place order group failed (HTTP {response.status_code}): {response.text[:200]}")
@@ -602,7 +634,7 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/marketdata/quotes/{symbols}"
-        response = await self._httpx.get(url, headers=await self._get_headers())
+        response = await self._request("GET", url)
         if response.status_code != 200:
             _log.debug(f"Get quotes failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Get quotes failed: HTTP {response.status_code}")
