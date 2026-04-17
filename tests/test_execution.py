@@ -6,10 +6,12 @@ instantiation is needed. Command-object tests verify that the execution
 client methods accept the correct NautilusTrader command types.
 """
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nautilus_tradestation.execution import (
+    TradeStationExecutionClient,
     convert_time_in_force,
     parse_order_status,
     parse_order_status_report,
@@ -21,9 +23,20 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
+    ModifyOrder,
 )
 from nautilus_trader.model.enums import OrderStatus, OrderType, TimeInForce
-from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, VenueOrderId
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientOrderId,
+    InstrumentId,
+    StrategyId,
+    Symbol,
+    TraderId,
+    Venue,
+    VenueOrderId,
+)
+from nautilus_trader.model.objects import Price, Quantity
 from tests.test_kit import TSTestOrderStubs
 
 
@@ -266,3 +279,183 @@ class TestReportCommandObjects:
             ts_init=1_000_000_000,
         )
         assert cmd.instrument_id is None
+
+
+# NOTE: upstream 9c7a430's reconnect-sentinel catch-up tests were NOT adopted
+# here — our stream-fill hardening (TS_STREAM_FILL_HARDENING + the 30s
+# status reconcile poll) covers the missed-fill window continuously; upstream's
+# approach is tracked as an evaluate-delta in the adoption triage doc.
+
+
+# =============================================================================
+# _modify_order: 4xx vs 5xx error handling
+# =============================================================================
+
+def _make_modify_command(
+    client_order_id: str = "O-001",
+    ts_order_id: str = "TS-001",
+) -> ModifyOrder:
+    return ModifyOrder(
+        TraderId("TRADER-001"),
+        StrategyId("S-001"),
+        InstrumentId(Symbol("GCJ26"), Venue("TRADESTATION")),
+        ClientOrderId(client_order_id),
+        VenueOrderId(ts_order_id),
+        Quantity.from_int(1),
+        Price(3350.0, 1),
+        None,   # trigger_price
+        UUID4(),
+        0,      # ts_init
+    )
+
+
+def _make_exec_mock(command: ModifyOrder, ts_order_id: str = "TS-001") -> MagicMock:
+    """Minimal mock that passes _modify_order's pre-checks and cache lookup."""
+    m = MagicMock()
+    m._client_order_id_to_ts_order_id = {command.client_order_id: ts_order_id}
+    order = MagicMock()
+    order.quantity = Quantity.from_int(1)
+    m._cache = MagicMock()
+    m._cache.order.return_value = order
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    m._account_id = "SIM001"
+    return m
+
+
+class TestModifyOrderErrorHandling:
+    """_modify_order emits generate_order_modify_rejected on 4xx only."""
+
+    @pytest.mark.asyncio
+    async def test_400_emits_modify_rejected(self):
+        """HTTP 400 from broker triggers generate_order_modify_rejected."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 400): Invalid Parameter")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+        _, kwargs = m.generate_order_modify_rejected.call_args
+        assert kwargs["client_order_id"] == cmd.client_order_id
+        assert "400" in kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_422_emits_modify_rejected(self):
+        """HTTP 422 (order not modifiable) also triggers the rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 422): Order not modifiable")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_5xx_does_not_emit_modify_rejected(self):
+        """HTTP 5xx is ambiguous — modify may have succeeded, so no rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_error_does_not_emit_modify_rejected(self):
+        """A generic network error is also ambiguous — no rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Connection timeout")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_success_emits_order_updated_not_rejected(self):
+        """On success generate_order_updated is called and rejected is not."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-001"})
+        m._ts_order_id_to_client_order_id = {}
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_updated.assert_called_once()
+        m.generate_order_modify_rejected.assert_not_called()
+
+
+# =============================================================================
+# _update_account_state: retry and graceful degradation
+# =============================================================================
+
+def _make_account_state_mock() -> MagicMock:
+    m = MagicMock()
+    m._account_id = "SIM001"
+    m._account_id_nautilus = AccountId("TRADESTATION-SIM001")
+    m.account_id = AccountId("TRADESTATION-SIM001")
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    return m
+
+
+_BALANCES_OK = {"CashBalance": "50000", "Equity": "55000", "MarketValue": "5000"}
+
+
+class TestUpdateAccountState:
+    """_update_account_state retries on failure and never raises."""
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self, monkeypatch):
+        """Happy path: account state fetched and generate_account_state called."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(return_value=_BALANCES_OK)
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transient_error_then_succeeds(self, monkeypatch):
+        """First attempt fails, second succeeds — generate_account_state called once."""
+        sleep_calls = []
+        async def mock_sleep(s): sleep_calls.append(s)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(
+            side_effect=[Exception("HTTP 500"), _BALANCES_OK]
+        )
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+        assert len(sleep_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_retries_exhausted_does_not_raise(self, monkeypatch):
+        """Three consecutive failures log a warning but do not raise."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)  # must not raise
+        m.generate_account_state.assert_not_called()
+        assert m._log.warning.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_logs_trading_continues_message(self, monkeypatch):
+        """Final warning message tells operator trading continues."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)
+
+        warning_messages = " ".join(
+            str(call) for call in m._log.warning.call_args_list
+        )
+        assert "Trading will continue" in warning_messages
