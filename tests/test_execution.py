@@ -400,7 +400,6 @@ def _make_account_state_mock() -> MagicMock:
     m._log = MagicMock()
     return m
 
-<<<<<<< HEAD
 
 _BALANCES_OK = {"CashBalance": "50000", "Equity": "55000", "MarketValue": "5000"}
 
@@ -460,105 +459,171 @@ class TestUpdateAccountState:
             str(call) for call in m._log.warning.call_args_list
         )
         assert "Trading will continue" in warning_messages
-=======
-        assert len(poll_calls) == 0
 
 
 # =============================================================================
-# _modify_order: 4xx vs 5xx error handling
+# _cancel_all_orders: instrument/strategy-scoped cancellation
 # =============================================================================
 
-def _make_modify_command(
-    client_order_id: str = "O-001",
-    ts_order_id: str = "TS-001",
-) -> ModifyOrder:
-    return ModifyOrder(
-        TraderId("TRADER-001"),
-        StrategyId("S-001"),
-        InstrumentId(Symbol("GCJ26"), Venue("TRADESTATION")),
-        ClientOrderId(client_order_id),
-        VenueOrderId(ts_order_id),
-        Quantity.from_int(1),
-        Price(3350.0, 1),
-        None,   # trigger_price
-        UUID4(),
-        0,      # ts_init
+from nautilus_trader.execution.messages import CancelAllOrders
+from nautilus_trader.model.enums import OrderSide
+
+
+def _make_cancel_all_command(
+    instrument_str: str = "GCJ26.TRADESTATION",
+    strategy_str: str = "S-001",
+    order_side: OrderSide = OrderSide.NO_ORDER_SIDE,
+) -> CancelAllOrders:
+    return CancelAllOrders(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId(strategy_str),
+        instrument_id=InstrumentId.from_str(instrument_str),
+        order_side=order_side,
+        command_id=UUID4(),
+        ts_init=0,
     )
 
 
-def _make_exec_mock(command: ModifyOrder, ts_order_id: str = "TS-001") -> MagicMock:
-    """Minimal mock that passes _modify_order's pre-checks and cache lookup."""
-    m = MagicMock()
-    m._client_order_id_to_ts_order_id = {command.client_order_id: ts_order_id}
+def _make_mock_order(
+    client_order_id: str,
+    venue_order_id: str,
+    side: OrderSide = OrderSide.BUY,
+    status: OrderStatus = OrderStatus.ACCEPTED,
+):
     order = MagicMock()
-    order.quantity = Quantity.from_int(1)
+    order.client_order_id = ClientOrderId(client_order_id)
+    order.venue_order_id = VenueOrderId(venue_order_id)
+    order.side = side
+    order.status = status
+    return order
+
+
+def _make_cancel_all_exec_mock(
+    open_orders=None,
+    inflight_orders=None,
+):
+    m = MagicMock()
     m._cache = MagicMock()
-    m._cache.order.return_value = order
+    m._cache.orders_open.return_value = open_orders or []
+    m._cache.orders_inflight.return_value = inflight_orders or []
+    m._client = MagicMock()
+    m._client.cancel_order = AsyncMock()
     m._clock = MagicMock()
     m._clock.timestamp_ns.return_value = 0
     m._log = MagicMock()
-    m._account_id = "SIM001"
+    m.generate_order_canceled = MagicMock()
     return m
 
 
-class TestModifyOrderErrorHandling:
-    """_modify_order emits generate_order_modify_rejected on 4xx only."""
+class TestCancelAllOrdersFiltering:
+    """_cancel_all_orders must only cancel orders for the specified
+    instrument and strategy, never touching other strategies' orders."""
 
     @pytest.mark.asyncio
-    async def test_400_emits_modify_rejected(self):
-        """HTTP 400 from broker triggers generate_order_modify_rejected."""
-        cmd = _make_modify_command()
-        m = _make_exec_mock(cmd)
-        m._client.replace_order = AsyncMock(
-            side_effect=Exception("Replace order failed (HTTP 400): Invalid Parameter")
+    async def test_cancels_only_matching_orders(self):
+        """Only orders returned by cache for this instrument+strategy get canceled."""
+        gc_order = _make_mock_order("O-GC-1", "TS-100", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[gc_order])
+
+        cmd = _make_cancel_all_command("GCJ26.TRADESTATION", "S-001")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._cache.orders_open.assert_called_once_with(
+            instrument_id=cmd.instrument_id,
+            strategy_id=cmd.strategy_id,
+            side=cmd.order_side,
         )
-        await TradeStationExecutionClient._modify_order(m, cmd)
-        m.generate_order_modify_rejected.assert_called_once()
-        _, kwargs = m.generate_order_modify_rejected.call_args
-        assert kwargs["client_order_id"] == cmd.client_order_id
-        assert "400" in kwargs["reason"]
+        m._client.cancel_order.assert_called_once_with(order_id="TS-100")
+        m.generate_order_canceled.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_422_emits_modify_rejected(self):
-        """HTTP 422 (order not modifiable) also triggers the rejection event."""
-        cmd = _make_modify_command()
-        m = _make_exec_mock(cmd)
-        m._client.replace_order = AsyncMock(
-            side_effect=Exception("Replace order failed (HTTP 422): Order not modifiable")
+    async def test_no_orders_skips_cancel(self):
+        """When cache returns no orders, no TS API calls are made."""
+        m = _make_cancel_all_exec_mock(open_orders=[])
+
+        cmd = _make_cancel_all_command("NQU26.TRADESTATION", "S-002")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_orders_all_canceled(self):
+        """All orders for the instrument+strategy are canceled."""
+        stop = _make_mock_order("O-1", "TS-200", OrderSide.SELL)
+        target = _make_mock_order("O-2", "TS-201", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[stop, target])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        assert m._client.cancel_order.call_count == 2
+        assert m.generate_order_canceled.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inflight_submitted_orders_included(self):
+        """Inflight orders with SUBMITTED status are also canceled."""
+        inflight = _make_mock_order(
+            "O-INF", "TS-300", OrderSide.BUY, OrderStatus.SUBMITTED,
         )
-        await TradeStationExecutionClient._modify_order(m, cmd)
-        m.generate_order_modify_rejected.assert_called_once()
+        m = _make_cancel_all_exec_mock(inflight_orders=[inflight])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-300")
 
     @pytest.mark.asyncio
-    async def test_5xx_does_not_emit_modify_rejected(self):
-        """HTTP 5xx is ambiguous — modify may have succeeded, so no rejection event."""
-        cmd = _make_modify_command()
-        m = _make_exec_mock(cmd)
-        m._client.replace_order = AsyncMock(
-            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable")
+    async def test_not_an_open_order_is_warning_not_error(self):
+        """Broker 'Not an open order' is logged as warning, not error."""
+        order = _make_mock_order("O-1", "TS-400")
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+        m._client.cancel_order = AsyncMock(
+            side_effect=Exception("Not an open order"),
         )
-        await TradeStationExecutionClient._modify_order(m, cmd)
-        m.generate_order_modify_rejected.assert_not_called()
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._log.warning.assert_called()
+        m.generate_order_canceled.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_network_error_does_not_emit_modify_rejected(self):
-        """A generic network error is also ambiguous — no rejection event."""
-        cmd = _make_modify_command()
-        m = _make_exec_mock(cmd)
-        m._client.replace_order = AsyncMock(
-            side_effect=Exception("Connection timeout")
-        )
-        await TradeStationExecutionClient._modify_order(m, cmd)
-        m.generate_order_modify_rejected.assert_not_called()
+    async def test_order_without_venue_id_skipped(self):
+        """Orders with no venue_order_id (not yet acknowledged) are skipped."""
+        order = _make_mock_order("O-1", "TS-500")
+        order.venue_order_id = None
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m._log.warning.assert_called()
 
     @pytest.mark.asyncio
-    async def test_success_emits_order_updated_not_rejected(self):
-        """On success generate_order_updated is called and rejected is not."""
-        cmd = _make_modify_command()
-        m = _make_exec_mock(cmd)
-        m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-001"})
-        m._ts_order_id_to_client_order_id = {}
-        await TradeStationExecutionClient._modify_order(m, cmd)
-        m.generate_order_updated.assert_called_once()
-        m.generate_order_modify_rejected.assert_not_called()
->>>>>>> 2132806 (fix: emit OrderModifyRejected on definitive 4xx broker rejection)
+    async def test_side_filter_applied(self):
+        """When command specifies a side, only that side is canceled."""
+        buy = _make_mock_order("O-BUY", "TS-600", OrderSide.BUY)
+        sell = _make_mock_order("O-SELL", "TS-601", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[buy, sell])
+
+        cmd = _make_cancel_all_command(order_side=OrderSide.SELL)
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-601")
+
+    @pytest.mark.asyncio
+    async def test_venue_confirmed_cancels_suppresses_synthetic_cancel(self, monkeypatch):
+        """With TS_VENUE_CONFIRMED_CANCELS=1 the DELETE 200 is only a
+        request ack: cancel_order is sent but no synthetic OrderCanceled is
+        generated — the terminal event must come from the venue (V-3 race)."""
+        monkeypatch.setenv("TS_VENUE_CONFIRMED_CANCELS", "1")
+        order = _make_mock_order("O-1", "TS-700", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-700")
+        m.generate_order_canceled.assert_not_called()
