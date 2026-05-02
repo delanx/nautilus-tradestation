@@ -139,13 +139,16 @@ class TradeStationHttpClient:
         """
         url = f"{self.base_url}/marketdata/barcharts/{symbol}"
         params: dict[str, str] = {"interval": interval, "unit": unit.value}
+        # NOTE: TS API accepts barsback combined with lastdate (returns
+        # `barsback` most-recent bars ending at `lastdate`). The previous
+        # if/else gating made historical chunked walks impossible because
+        # `lastdate` was silently dropped whenever `barsback` was set.
         if barsback:
             params["barsback"] = str(barsback)
-        else:
-            if first_date:
-                params["firstdate"] = first_date
-            if last_date:
-                params["lastdate"] = last_date
+        if first_date:
+            params["firstdate"] = first_date
+        if last_date:
+            params["lastdate"] = last_date
 
         response = await self._httpx.get(url, headers=await self._get_headers(), params=params)
         if response.status_code != 200:
