@@ -131,7 +131,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._client_order_id_to_ts_order_id: dict[ClientOrderId, str] = {}
 
         # Fill detection — polling or streaming
-        self._order_last_status: dict[str, str] = {}   # ts_order_id → last seen status
+        self._order_last_status: dict[str, str] = {}  # ts_order_id → last seen status
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
 
@@ -143,8 +143,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
             from nautilus_tradestation.streaming.client import (
                 TradeStationStreamClient,
             )
+
             self._stream_client = TradeStationStreamClient(
                 access_token_provider=lambda: self._client.access_token,
+                access_token_refresher=lambda force_refresh=False: self._client.get_access_token(
+                    force_refresh=force_refresh
+                ),
                 base_url=self._client.base_url,
                 reconnect_delay_secs=streaming_reconnect_delay_secs,
             )
@@ -159,7 +163,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # Test authentication by fetching account info
         try:
             accounts = await self._client.get_accounts()
-            self._log.info(f"Successfully authenticated. Found {len(accounts)} account(s)")
+            self._log.info(
+                f"Successfully authenticated. Found {len(accounts)} account(s)"
+            )
 
             # Fetch initial balances and positions
             await self._update_account_state()
@@ -170,10 +176,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         # Start background fill detection (streaming or polling)
         if self._use_streaming and self._stream_client:
-            self._fill_poll_task = self._loop.create_task(
-                self._stream_order_fills()
+            self._fill_poll_task = self._loop.create_task(self._stream_order_fills())
+            self._log.info(
+                "Started order fill detection via SSE streaming", LogColor.GREEN
             )
-            self._log.info("Started order fill detection via SSE streaming", LogColor.GREEN)
         else:
             self._fill_poll_task = self._loop.create_task(self._poll_order_fills())
             self._log.info(
@@ -221,7 +227,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             ts_order_id = str(venue_order_id)
 
         if not ts_order_id:
-            self._log.warning(f"Cannot find TradeStation order ID for {client_order_id}")
+            self._log.warning(
+                f"Cannot find TradeStation order ID for {client_order_id}"
+            )
             return None
 
         # Fetch order from TradeStation
@@ -241,7 +249,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._log.warning(f"Order {ts_order_id} not found at TradeStation")
                 return None
 
-            return self._parse_order_status_report(ts_order, instrument_id, client_order_id)
+            return self._parse_order_status_report(
+                ts_order, instrument_id, client_order_id
+            )
 
         except Exception as e:
             self._log.error(f"Failed to generate order status report: {e}")
@@ -295,7 +305,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Filter by open only
                 if open_only:
                     status = self._parse_order_status(ts_order.get("Status", ""))
-                    if status not in (OrderStatus.ACCEPTED, OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED):
+                    if status not in (
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                    ):
                         continue
 
                 report = self._parse_order_status_report(
@@ -423,7 +437,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     continue  # Skip zero positions
 
                 # Determine side — PositionSide not OrderSide
-                position_side = PositionSide.LONG if quantity > 0 else PositionSide.SHORT
+                position_side = (
+                    PositionSide.LONG if quantity > 0 else PositionSide.SHORT
+                )
 
                 report = PositionStatusReport(
                     account_id=self._account_id_nautilus,
@@ -461,7 +477,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
 
             # Extract order ID from response
-            ts_order_id = response.get("OrderID") or response.get("Orders", [{}])[0].get("OrderID")
+            ts_order_id = response.get("OrderID") or response.get("Orders", [{}])[
+                0
+            ].get("OrderID")
 
             if not ts_order_id:
                 raise ValueError(f"No OrderID in response: {response}")
@@ -561,12 +579,18 @@ class TradeStationExecutionClient(LiveExecutionClient):
             for i, (order, ts_order_resp) in enumerate(zip(orders, ts_orders)):
                 ts_order_id = ts_order_resp.get("OrderID")
                 if not ts_order_id:
-                    self._log.warning(f"No OrderID in group response leg {i}: {ts_order_resp}")
+                    self._log.warning(
+                        f"No OrderID in group response leg {i}: {ts_order_resp}"
+                    )
                     continue
 
                 # Register in tracking dicts
-                self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
-                self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
+                self._ts_order_id_to_client_order_id[ts_order_id] = (
+                    order.client_order_id
+                )
+                self._client_order_id_to_ts_order_id[order.client_order_id] = (
+                    ts_order_id
+                )
 
                 # Generate accepted event for each leg
                 self.generate_order_accepted(
@@ -646,10 +670,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
 
             # TS returns a new OrderID when the order is replaced
-            new_ts_order_id = (
-                response.get("OrderID")
-                or response.get("Orders", [{}])[0].get("OrderID")
-            )
+            new_ts_order_id = response.get("OrderID") or response.get("Orders", [{}])[
+                0
+            ].get("OrderID")
             if new_ts_order_id and new_ts_order_id != ts_order_id:
                 # Update our ID maps to point to the new venue order ID
                 self._ts_order_id_to_client_order_id.pop(ts_order_id, None)
@@ -685,7 +708,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         ts_order_id = self._client_order_id_to_ts_order_id.get(command.client_order_id)
 
         if not ts_order_id:
-            self._log.error(f"Cannot find TradeStation order ID for {command.client_order_id}")
+            self._log.error(
+                f"Cannot find TradeStation order ID for {command.client_order_id}"
+            )
             return
 
         try:
@@ -722,7 +747,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"(expired DAY order or concurrent fill) — no cancel event generated"
                 )
             else:
-                self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
+                self._log.error(
+                    f"Failed to cancel order {command.client_order_id}: {e}"
+                )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         """Cancel all open orders."""
@@ -749,9 +776,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         self._log.info(f"Cancelled order {ts_order_id}")
                     except Exception as e:
                         if "Not an open order" in str(e):
-                            self._log.warning(f"Order {ts_order_id} already gone at broker — skipping")
+                            self._log.warning(
+                                f"Order {ts_order_id} already gone at broker — skipping"
+                            )
                         else:
-                            self._log.error(f"Failed to cancel order {ts_order_id}: {e}")
+                            self._log.error(
+                                f"Failed to cancel order {ts_order_id}: {e}"
+                            )
 
         except Exception as e:
             self._log.error(f"Failed to cancel all orders: {e}")
@@ -837,7 +868,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if status == "FLL":
                 # Fully filled
                 avg_px_str = ts_order.get("AveragePrice", "0")
-                filled_qty_str = ts_order.get("FilledQuantity", str(cached_order.quantity))
+                filled_qty_str = ts_order.get(
+                    "FilledQuantity", str(cached_order.quantity)
+                )
 
                 try:
                     fill_px_raw = float(avg_px_str) if avg_px_str else 0.0
@@ -849,15 +882,18 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         #   3. Order's own trigger_price (StopMarket) or price (Limit)
                         filled_price = ts_order.get("FilledPrice", "") or ""
                         if not filled_price and ts_order.get("Legs"):
-                            filled_price = ts_order["Legs"][0].get("ExecutionPrice", "") or ""
+                            filled_price = (
+                                ts_order["Legs"][0].get("ExecutionPrice", "") or ""
+                            )
                         if filled_price and float(filled_price) > 0:
                             avg_px_str = filled_price
                         else:
                             # Last resort: use the order's own price (stop trigger or limit)
-                            fallback = (
-                                getattr(cached_order, "trigger_price", None)  # StopMarket
-                                or getattr(cached_order, "price", None)        # Limit
-                            )
+                            fallback = getattr(
+                                cached_order, "trigger_price", None
+                            ) or getattr(  # StopMarket
+                                cached_order, "price", None
+                            )  # Limit
                             avg_px_str = str(fallback) if fallback else "0"
                         self._log.warning(
                             f"AveragePrice=0 for filled order {client_order_id}; "
@@ -1014,7 +1050,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 ts_event=ts_now,
             )
-            self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
+            self._log.info(
+                f"Stream: order canceled: {client_order_id} (status={status})"
+            )
 
         elif status in ("REJ", "BRO", "LAT"):
             reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
@@ -1042,13 +1080,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # MarketValue is negative for short positions — clamp to 0.
             # NautilusTrader requires non-negative MarginBalance values.
             # We don't enforce margin limits so 0 is safe when short.
-            margin_used = max(Decimal("0"), Decimal(balances_data.get("MarketValue", "0")))
+            margin_used = max(
+                Decimal("0"), Decimal(balances_data.get("MarketValue", "0"))
+            )
 
             # Generate account state event
             balances = [
                 AccountBalance(
                     Money(cash_balance, Currency.from_str("USD")),
-                    Money(0, Currency.from_str("USD")),  # No locked balance in this context
+                    Money(
+                        0, Currency.from_str("USD")
+                    ),  # No locked balance in this context
                     Money(cash_balance, Currency.from_str("USD")),
                 ),
             ]
@@ -1091,15 +1133,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
         instrument = self._cache.instrument(order.instrument_id)
         if instrument is not None:
             from nautilus_trader.model.instruments import Equity
+
             if isinstance(instrument, Equity):
                 # For equities, TS requires SellShort/BuyToCover for short positions
                 # Calculate net position from open positions in cache
                 open_positions = self._cache.positions_open(
                     instrument_id=order.instrument_id,
                 )
-                net_pos = sum(
-                    p.signed_qty for p in open_positions
-                ) if open_positions else 0
+                net_pos = (
+                    sum(p.signed_qty for p in open_positions) if open_positions else 0
+                )
 
                 if order.side == OrderSide.SELL:
                     if net_pos <= 0:
@@ -1154,4 +1197,3 @@ class TradeStationExecutionClient(LiveExecutionClient):
     def _parse_ts_order_type(self, ts_order_type: str) -> OrderType:
         """Parse TradeStation order type to Nautilus OrderType."""
         return parse_ts_order_type(ts_order_type)
-

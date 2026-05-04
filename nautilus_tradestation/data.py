@@ -97,8 +97,12 @@ class TradeStationDataClient(LiveMarketDataClient):
             from nautilus_tradestation.streaming.client import (
                 TradeStationStreamClient,
             )
+
             self._stream_client = TradeStationStreamClient(
                 access_token_provider=lambda: self._client.access_token,
+                access_token_refresher=lambda force_refresh=False: self._client.get_access_token(
+                    force_refresh=force_refresh
+                ),
                 base_url=self._client.base_url,
                 reconnect_delay_secs=streaming_reconnect_delay_secs,
             )
@@ -181,7 +185,9 @@ class TradeStationDataClient(LiveMarketDataClient):
                 if instrument:
                     self._cache.add_instrument(instrument)
                     self._handle_data(instrument)
-                    self._log.info(f"Loaded and subscribed to instrument: {instrument_id}")
+                    self._log.info(
+                        f"Loaded and subscribed to instrument: {instrument_id}"
+                    )
                 else:
                     self._log.error(f"Failed to load instrument: {instrument_id}")
             else:
@@ -298,6 +304,7 @@ class TradeStationDataClient(LiveMarketDataClient):
             # When extended_hours is enabled and the instrument is an equity,
             # use USEQPreAndPost to receive pre-market and after-hours bars.
             from nautilus_trader.model.instruments import Equity
+
             session_tpl = (
                 "USEQPreAndPost"
                 if self._extended_hours and isinstance(instrument, Equity)
@@ -350,7 +357,9 @@ class TradeStationDataClient(LiveMarketDataClient):
                         # of a bar we missed.  Emit both in chronological order.
                         if buffered_event:
                             bars = self._parse_bars(
-                                [buffered_event], bar_type, instrument,
+                                [buffered_event],
+                                bar_type,
+                                instrument,
                             )
                             for bar in bars:
                                 self._handle_data(bar)
@@ -360,7 +369,9 @@ class TradeStationDataClient(LiveMarketDataClient):
                             )
                         # Emit the seed bar (accurately closed during gap)
                         bars = self._parse_bars(
-                            [event], bar_type, instrument,
+                            [event],
+                            bar_type,
+                            instrument,
                         )
                         for bar in bars:
                             self._handle_data(bar)
@@ -390,13 +401,13 @@ class TradeStationDataClient(LiveMarketDataClient):
                     # Timestamp changed → the buffered bar is now closed.
                     if buffered_event:
                         bars = self._parse_bars(
-                            [buffered_event], bar_type, instrument,
+                            [buffered_event],
+                            bar_type,
+                            instrument,
                         )
                         for bar in bars:
                             self._handle_data(bar)
-                        self._log.debug(
-                            f"Bar emitted for {bar_type}: ts={buffered_ts}"
-                        )
+                        self._log.debug(f"Bar emitted for {bar_type}: ts={buffered_ts}")
                     # Start buffering the new bar
                     buffered_ts = event_ts
                     buffered_event = event
@@ -561,9 +572,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         """Start the shared SSE quote stream for *instrument_id* if not already running."""
         if instrument_id in self._quote_stream_tasks:
             return  # already streaming
-        task = self._loop.create_task(
-            self._stream_quote_mux(instrument_id, instrument)
-        )
+        task = self._loop.create_task(self._stream_quote_mux(instrument_id, instrument))
         self._quote_stream_tasks[instrument_id] = task
 
     def _maybe_stop_quote_stream(self, instrument_id: InstrumentId) -> None:
@@ -616,13 +625,13 @@ class TradeStationDataClient(LiveMarketDataClient):
                         if tick:
                             self._handle_data(tick)
         except asyncio.CancelledError:
-            self._log.info(
-                f"Shared quote/trade SSE stream stopped for {instrument_id}"
-            )
+            self._log.info(f"Shared quote/trade SSE stream stopped for {instrument_id}")
 
     # -- POLLING FALLBACKS (used when streaming is disabled) -------------------
 
-    async def _poll_quotes(self, instrument_id: InstrumentId, instrument: Instrument) -> None:
+    async def _poll_quotes(
+        self, instrument_id: InstrumentId, instrument: Instrument
+    ) -> None:
         """Background loop: fetch bid/ask every second, emit QuoteTick when changed."""
         symbol = instrument_id.symbol.value
         self._log.info(f"Quote polling loop started for {instrument_id}")
@@ -650,7 +659,9 @@ class TradeStationDataClient(LiveMarketDataClient):
                 self._log.error(f"Error in quote polling loop for {instrument_id}: {e}")
                 await asyncio.sleep(5.0)
 
-    async def _poll_trades(self, instrument_id: InstrumentId, instrument: Instrument) -> None:
+    async def _poll_trades(
+        self, instrument_id: InstrumentId, instrument: Instrument
+    ) -> None:
         """Background loop: fetch last trade every second, emit TradeTick when changed."""
         symbol = instrument_id.symbol.value
         self._log.info(f"Trade polling loop started for {instrument_id}")

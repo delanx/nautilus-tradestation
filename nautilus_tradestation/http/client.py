@@ -6,6 +6,7 @@ directly without ``asyncio.to_thread`` wrappers.
 """
 
 import os
+import asyncio
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
@@ -65,6 +66,7 @@ class TradeStationHttpClient:
 
         self.access_token: str | None = None
         self.token_expiry: datetime | None = None
+        self._auth_lock = asyncio.Lock()
 
         # Persistent async HTTP client — reuses TCP connections across requests.
         # Closed in close(); callers should not share instances across event loops.
@@ -76,13 +78,33 @@ class TradeStationHttpClient:
         )
 
     async def _ensure_authenticated(self) -> None:
-        if not self.access_token or not self.token_expiry:
-            await self._refresh_access_token()
-            return
-        if datetime.utcnow() >= self.token_expiry - timedelta(minutes=5):
-            await self._refresh_access_token()
+        await self.get_access_token(force_refresh=False)
 
     async def _refresh_access_token(self) -> None:
+        await self.get_access_token(force_refresh=True)
+
+    async def get_access_token(self, *, force_refresh: bool = False) -> str:
+        """Return a valid access token, refreshing proactively when needed.
+
+        This is used by both REST calls and long-running SSE streams. Keeping
+        the token refresh decision centralized prevents SSE reconnect loops
+        from repeatedly opening with a stale bearer token.
+        """
+
+        async with self._auth_lock:
+            needs_refresh = (
+                force_refresh
+                or not self.access_token
+                or not self.token_expiry
+                or datetime.utcnow() >= self.token_expiry - timedelta(minutes=5)
+            )
+            if needs_refresh:
+                await self._refresh_access_token_unlocked()
+            if not self.access_token:
+                raise Exception("TradeStation authentication failed: no access token")
+            return self.access_token
+
+    async def _refresh_access_token_unlocked(self) -> None:
         data = {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
@@ -96,6 +118,8 @@ class TradeStationHttpClient:
         self.access_token = token_data["access_token"]
         expires_in = token_data.get("expires_in", 1200)
         self.token_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
+        if token_data.get("refresh_token"):
+            self.refresh_token = token_data["refresh_token"]
 
     async def _get_headers(self) -> dict[str, str]:
         await self._ensure_authenticated()
@@ -150,7 +174,9 @@ class TradeStationHttpClient:
         if last_date:
             params["lastdate"] = last_date
 
-        response = await self._httpx.get(url, headers=await self._get_headers(), params=params)
+        response = await self._httpx.get(
+            url, headers=await self._get_headers(), params=params
+        )
         if response.status_code != 200:
             raise Exception(f"TradeStation API request failed: {response.text}")
         return response.json().get("Bars", [])
@@ -180,7 +206,9 @@ class TradeStationHttpClient:
         params = {}
         if category:
             params["category"] = category
-        response = await self._httpx.get(url, headers=await self._get_headers(), params=params)
+        response = await self._httpx.get(
+            url, headers=await self._get_headers(), params=params
+        )
         if response.status_code != 200:
             raise Exception(f"Symbol search failed: {response.text}")
         return response.json()
@@ -439,7 +467,9 @@ class TradeStationHttpClient:
         params: dict[str, str] = {}
         if since:
             params["since"] = since
-        response = await self._httpx.get(url, headers=await self._get_headers(), params=params)
+        response = await self._httpx.get(
+            url, headers=await self._get_headers(), params=params
+        )
         if response.status_code != 200:
             raise Exception(f"Get orders failed: {response.text}")
         data = response.json()
