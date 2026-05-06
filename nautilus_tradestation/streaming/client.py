@@ -33,6 +33,7 @@ Usage
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from typing import Callable
@@ -142,6 +143,7 @@ class TradeStationStreamClient:
                         delay = self._reconnect_delay  # reset on successful connect
 
                         async for line in resp.aiter_lines():
+                            received_ns = time.time_ns()
                             line = line.strip()
                             if not line:
                                 continue
@@ -155,6 +157,7 @@ class TradeStationStreamClient:
                             if any(k in event for k in _HEARTBEAT_KEYS):
                                 continue
 
+                            event["_ts_sse_received_ns"] = received_ns
                             yield event
 
             except asyncio.CancelledError:

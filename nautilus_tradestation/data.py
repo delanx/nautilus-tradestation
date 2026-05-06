@@ -3,6 +3,7 @@ TradeStation data client implementation.
 """
 
 import asyncio
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -357,7 +358,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                         # of a bar we missed.  Emit both in chronological order.
                         if buffered_event:
                             bars = self._parse_bars(
-                                [buffered_event],
+                                [self._mark_bar_emit(buffered_event)],
                                 bar_type,
                                 instrument,
                             )
@@ -369,7 +370,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                             )
                         # Emit the seed bar (accurately closed during gap)
                         bars = self._parse_bars(
-                            [event],
+                            [self._mark_bar_emit(event)],
                             bar_type,
                             instrument,
                         )
@@ -401,7 +402,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                     # Timestamp changed → the buffered bar is now closed.
                     if buffered_event:
                         bars = self._parse_bars(
-                            [buffered_event],
+                            [self._mark_bar_emit(buffered_event)],
                             bar_type,
                             instrument,
                         )
@@ -764,3 +765,9 @@ class TradeStationDataClient(LiveMarketDataClient):
         instrument: Instrument,
     ) -> list[Bar]:
         return parse_bars(raw_bars, bar_type)
+
+    @staticmethod
+    def _mark_bar_emit(raw_bar: dict) -> dict:
+        marked = dict(raw_bar)
+        marked["_ts_bar_emit_ns"] = time.time_ns()
+        return marked
