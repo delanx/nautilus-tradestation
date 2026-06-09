@@ -177,6 +177,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # Start background fill detection (streaming or polling)
         if self._use_streaming and self._stream_client:
             self._fill_poll_task = self._loop.create_task(self._stream_order_fills())
+            # BACKSTOP: retrieve any escaped exception (prevent the asyncio "Task
+            # exception was never retrieved" escalation that can crash node.run())
+            # and resubscribe the fill stream if it ever ends non-cancelled.
+            self._fill_poll_task.add_done_callback(self._on_fill_task_done)
             self._log.info(
                 "Started order fill detection via SSE streaming", LogColor.GREEN
             )
@@ -959,14 +963,51 @@ class TradeStationExecutionClient(LiveExecutionClient):
         immediately rather than waiting up to ``_fill_poll_interval`` seconds.
         """
         self._log.info("Order fill SSE stream started")
+        # SELF-HEALING SUPERVISION (Phase 0): the order-fill feed must NEVER die
+        # from a stream drop -- if it does, submitted orders stop being confirmed
+        # (fills/cancels/rejects are missed) and position tracking silently breaks.
+        # Per-event processing is already guarded; this outer loop additionally
+        # survives the SSE stream itself raising (reconnect exhaustion / peer close)
+        # by logging, backing off, and RE-ENTERING the stream.
+        retry_delay = 1.0
+        while True:
+            try:
+                async for event in self._stream_client.stream_orders(self._account_id):
+                    retry_delay = 1.0  # healthy event resets the backoff
+                    try:
+                        await self._process_order_event(event)
+                    except Exception as e:
+                        self._log.error(f"Error processing streamed order event: {e}")
+            except asyncio.CancelledError:
+                self._log.info("Order fill SSE stream stopped")
+                return
+            except Exception as exc:  # noqa: BLE001 -- supervise: never let fills die
+                self._log.error(
+                    f"Order fill SSE stream failed: {exc!r}; "
+                    f"resubscribing in {retry_delay:.0f}s"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 60.0)
+
+    def _on_fill_task_done(self, task: asyncio.Task) -> None:
+        """Backstop for the order-fill stream task (see _on_bar_task_done)."""
+        if task.cancelled():
+            return
+        exc = None
         try:
-            async for event in self._stream_client.stream_orders(self._account_id):
-                try:
-                    await self._process_order_event(event)
-                except Exception as e:
-                    self._log.error(f"Error processing streamed order event: {e}")
-        except asyncio.CancelledError:
-            self._log.info("Order fill SSE stream stopped")
+            exc = task.exception()
+        except Exception:  # noqa: BLE001
+            return
+        if exc is None:
+            return
+        self._log.error(f"Order fill stream task ENDED with {exc!r}; resubscribing")
+        if getattr(self, "_is_disconnecting", False):
+            return
+        try:
+            self._fill_poll_task = self._loop.create_task(self._stream_order_fills())
+            self._fill_poll_task.add_done_callback(self._on_fill_task_done)
+        except Exception as e:  # noqa: BLE001
+            self._log.error(f"Failed to resubscribe order fill stream: {e!r}")
 
     async def _process_order_event(self, ts_order: dict) -> None:
         """Process a single order event (from streaming or polling) and emit NT events."""

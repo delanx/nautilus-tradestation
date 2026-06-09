@@ -111,6 +111,9 @@ class TradeStationDataClient(LiveMarketDataClient):
         # Bar subscription state
         self._bar_subscriptions: dict[BarType, asyncio.Task] = {}
         self._last_bar_ts: dict[BarType, str] = {}
+        # Phase 1: per-bar_type degraded-feed markers (set when a stream is mid-
+        # resubscribe) so a heartbeat/V&V layer can alert instead of seeing silence.
+        self._feed_degraded: dict[str, dict] = {}
 
         # Quote/trade tick state (polling or streaming tasks)
         self._quote_subscriptions: dict[InstrumentId, asyncio.Task] = {}
@@ -243,6 +246,16 @@ class TradeStationDataClient(LiveMarketDataClient):
             task = self._loop.create_task(
                 self._stream_bars(bar_type, symbol, interval, unit, instrument)
             )
+            # BACKSTOP (Phase 0): the supervising retry loop in _stream_bars means
+            # the task should only ever end on cancellation -- but if it somehow
+            # ends with an exception, this callback RETRIEVES it (preventing the
+            # asyncio "Task exception was never retrieved" escalation that can take
+            # down node.run()) and resubscribes the feed instead of leaving it dead.
+            task.add_done_callback(
+                lambda t, bt=bar_type, s=symbol, iv=interval, u=unit, inst=instrument: (
+                    self._on_bar_task_done(t, bt, s, iv, u, inst)
+                )
+            )
             self._bar_subscriptions[bar_type] = task
             self._log.info(
                 f"Subscribed to {bar_type} (SSE streaming, "
@@ -297,127 +310,196 @@ class TradeStationDataClient(LiveMarketDataClient):
           a completed bar that was missed during the outage.
         """
         self._log.info(f"Bar SSE stream started for {bar_type}")
-        buffered_event: dict | None = None
-        buffered_ts: str = ""
-        initialized = False  # True after first RealTime event processed
+        # When extended_hours is enabled and the instrument is an equity, use
+        # USEQPreAndPost to receive pre-market and after-hours bars.
+        from nautilus_trader.model.instruments import Equity
 
-        try:
-            # When extended_hours is enabled and the instrument is an equity,
-            # use USEQPreAndPost to receive pre-market and after-hours bars.
-            from nautilus_trader.model.instruments import Equity
+        session_tpl = (
+            "USEQPreAndPost"
+            if self._extended_hours and isinstance(instrument, Equity)
+            else None
+        )
+        # Buffer state persists ACROSS resubscribes so a stream drop loses no bar:
+        # on re-entry the Status=Historical seed bar drives gap recovery against
+        # this same buffer.  {buffered_event, buffered_ts, initialized}.
+        st: dict = {"buffered_event": None, "buffered_ts": "", "initialized": False}
 
-            session_tpl = (
-                "USEQPreAndPost"
-                if self._extended_hours and isinstance(instrument, Equity)
-                else None
-            )
+        # SELF-HEALING SUPERVISION (Phase 0): the bar feed must NEVER die from a
+        # stream drop or a per-bar processing error.  The lower-level SSE reader
+        # reconnects, but if it EXHAUSTS its retries ("peer closed connection /
+        # incomplete chunked read") or anything inside raises, the exception used
+        # to escape, end the task, and silently kill this bar_type's feed -- taking
+        # every pod on this shared node's instrument with it (the 2026-06-09 node
+        # death).  Now: on ANY non-cancel error we log, mark the feed degraded,
+        # back off, and RE-ENTER the stream.  The node SURVIVES the drop.
+        retry_delay = 1.0
+        while True:
+            try:
+                async for event in self._stream_client.stream_bars(
+                    symbol=symbol,
+                    interval=interval,
+                    unit=unit.value,
+                    session_template=session_tpl,
+                ):
+                    retry_delay = 1.0  # a healthy event resets the backoff
+                    self._handle_bar_stream_event(event, bar_type, instrument, st)
+            except asyncio.CancelledError:
+                self._log.info(f"Bar SSE stream stopped for {bar_type}")
+                return
+            except Exception as exc:  # noqa: BLE001 -- supervise: never let the feed die
+                self._log.error(
+                    f"Bar SSE stream for {bar_type} failed: {exc!r}; "
+                    f"resubscribing in {retry_delay:.0f}s"
+                )
+                self._mark_feed_degraded(bar_type, repr(exc))
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 60.0)
 
-            async for event in self._stream_client.stream_bars(
-                symbol=symbol,
-                interval=interval,
-                unit=unit.value,
-                session_template=session_tpl,
-            ):
-                event_ts = event.get("TimeStamp", "")
-                if not event_ts:
-                    continue
+    def _handle_bar_stream_event(
+        self, event: dict, bar_type: BarType, instrument: Instrument, st: dict
+    ) -> None:
+        """Process one SSE bar event into the buffer + emit closed bars.
 
-                is_historical = event.get("Status") == "Historical"
+        ``st`` is the per-stream buffer state ({buffered_event, buffered_ts,
+        initialized}); it is mutated in place so it survives resubscribes.
+        """
+        event_ts = event.get("TimeStamp", "")
+        if not event_ts:
+            return
 
-                if is_historical:
-                    if not initialized:
-                        # Initial connection seed bar — skip it; the buffer
-                        # is empty and we don't want to emit a potentially
-                        # stale bar before live data starts flowing.
-                        self._log.debug(
-                            f"Bar stream skipping initial seed for {bar_type}: "
-                            f"ts={event_ts}"
-                        )
-                        continue
+        is_historical = event.get("Status") == "Historical"
 
-                    # Reconnection seed bar — use it for gap recovery.
-                    if event_ts == buffered_ts:
-                        # Same bar period as buffer → replace with accurate
-                        # close values from the completed bar.
-                        buffered_event = event
-                        self._log.debug(
-                            f"Bar stream corrected buffer for {bar_type}: "
-                            f"ts={event_ts}"
-                        )
-                    elif event_ts < buffered_ts:
-                        # Seed is OLDER than the buffered bar — we reconnected
-                        # within the same bar period.  The seed is a bar we
-                        # already emitted before.  Ignore it and keep buffering.
-                        self._log.debug(
-                            f"Bar stream ignoring stale seed for {bar_type}: "
-                            f"seed_ts={event_ts} < buffered_ts={buffered_ts}"
-                        )
-                    else:
-                        # Seed is NEWER → the buffered bar closed during the
-                        # outage and this seed bar is the completed version
-                        # of a bar we missed.  Emit both in chronological order.
-                        if buffered_event:
-                            bars = self._parse_bars(
-                                [self._mark_bar_emit(buffered_event)],
-                                bar_type,
-                                instrument,
-                            )
-                            for bar in bars:
-                                self._handle_data(bar)
-                            self._log.debug(
-                                f"Bar emitted (pre-gap) for {bar_type}: "
-                                f"ts={buffered_ts}"
-                            )
-                        # Emit the seed bar (accurately closed during gap)
-                        bars = self._parse_bars(
-                            [self._mark_bar_emit(event)],
-                            bar_type,
-                            instrument,
-                        )
-                        for bar in bars:
-                            self._handle_data(bar)
-                        self._log.info(
-                            f"Bar gap recovery for {bar_type}: emitted seed "
-                            f"ts={event_ts}"
-                        )
-                        # Reset buffer — the next RealTime event will start
-                        # a fresh buffer for the currently-forming bar.
-                        buffered_ts = ""
-                        buffered_event = None
-                    continue
+        if is_historical:
+            if not st["initialized"]:
+                # Initial connection seed bar — skip it; the buffer is empty and
+                # we don't want to emit a potentially stale bar before live data.
+                self._log.debug(
+                    f"Bar stream skipping initial seed for {bar_type}: ts={event_ts}"
+                )
+                return
 
-                # --- RealTime event ---
-
-                if not buffered_ts:
-                    # First RealTime event (or first after gap recovery reset).
-                    buffered_ts = event_ts
-                    buffered_event = event
-                    initialized = True
-                    self._log.debug(
-                        f"Bar stream initialised for {bar_type}: ts={event_ts}"
+            # Reconnection seed bar — use it for gap recovery.
+            if event_ts == st["buffered_ts"]:
+                # Same bar period as buffer → replace with accurate close values.
+                st["buffered_event"] = event
+                self._log.debug(
+                    f"Bar stream corrected buffer for {bar_type}: ts={event_ts}"
+                )
+            elif event_ts < st["buffered_ts"]:
+                # Seed OLDER than the buffer — reconnected within the same bar
+                # period; the seed is a bar we already emitted. Ignore it.
+                self._log.debug(
+                    f"Bar stream ignoring stale seed for {bar_type}: "
+                    f"seed_ts={event_ts} < buffered_ts={st['buffered_ts']}"
+                )
+            else:
+                # Seed NEWER → the buffered bar closed during the outage and this
+                # seed is the completed version of a bar we missed. Emit both.
+                if st["buffered_event"]:
+                    bars = self._parse_bars(
+                        [self._mark_bar_emit(st["buffered_event"])], bar_type, instrument
                     )
-                    continue
+                    for bar in bars:
+                        self._handle_data(bar)
+                    self._log.debug(
+                        f"Bar emitted (pre-gap) for {bar_type}: ts={st['buffered_ts']}"
+                    )
+                bars = self._parse_bars(
+                    [self._mark_bar_emit(event)], bar_type, instrument
+                )
+                for bar in bars:
+                    self._handle_data(bar)
+                self._log.info(
+                    f"Bar gap recovery for {bar_type}: emitted seed ts={event_ts}"
+                )
+                st["buffered_ts"] = ""
+                st["buffered_event"] = None
+            return
 
-                if event_ts != buffered_ts:
-                    # Timestamp changed → the buffered bar is now closed.
-                    if buffered_event:
-                        bars = self._parse_bars(
-                            [self._mark_bar_emit(buffered_event)],
-                            bar_type,
-                            instrument,
-                        )
-                        for bar in bars:
-                            self._handle_data(bar)
-                        self._log.debug(f"Bar emitted for {bar_type}: ts={buffered_ts}")
-                    # Start buffering the new bar
-                    buffered_ts = event_ts
-                    buffered_event = event
-                else:
-                    # Same timestamp — update the buffer with latest OHLCV
-                    buffered_event = event
+        # --- RealTime event ---
+        if not st["buffered_ts"]:
+            st["buffered_ts"] = event_ts
+            st["buffered_event"] = event
+            st["initialized"] = True
+            self._log.debug(f"Bar stream initialised for {bar_type}: ts={event_ts}")
+            return
 
-        except asyncio.CancelledError:
-            self._log.info(f"Bar SSE stream stopped for {bar_type}")
+        if event_ts != st["buffered_ts"]:
+            # Timestamp changed → the buffered bar is now closed.
+            if st["buffered_event"]:
+                bars = self._parse_bars(
+                    [self._mark_bar_emit(st["buffered_event"])], bar_type, instrument
+                )
+                for bar in bars:
+                    self._handle_data(bar)
+                self._log.debug(f"Bar emitted for {bar_type}: ts={st['buffered_ts']}")
+            st["buffered_ts"] = event_ts
+            st["buffered_event"] = event
+        else:
+            # Same timestamp — update the buffer with latest OHLCV.
+            st["buffered_event"] = event
+
+    def _mark_feed_degraded(self, bar_type: BarType, reason: str) -> None:
+        """Best-effort marker that a feed is mid-resubscribe (Phase 1 alerting).
+
+        Records the last degrade/recover on the client so a heartbeat/V&V layer
+        can surface 'feed degraded' instead of discovering silence hours later.
+        Never raises.
+        """
+        try:
+            import time as _t
+
+            self._feed_degraded[str(bar_type)] = {"reason": reason, "ts": _t.time()}
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_bar_task_done(
+        self,
+        task: asyncio.Task,
+        bar_type: BarType,
+        symbol: str,
+        interval: str,
+        unit: "TradeStationBarUnit",
+        instrument: Instrument,
+    ) -> None:
+        """Backstop: retrieve any escaped task exception + resubscribe the feed.
+
+        With the supervising retry loop in _stream_bars this should fire only on
+        cancellation, but if the task ever ends with an exception we MUST call
+        ``task.exception()`` to retrieve it (otherwise asyncio escalates "Task
+        exception was never retrieved" to the loop, which can crash node.run()),
+        then -- unless we are shutting down -- recreate the stream task so the feed
+        is never left dead.
+        """
+        if task.cancelled():
+            return
+        exc = None
+        try:
+            exc = task.exception()
+        except Exception:  # noqa: BLE001 -- retrieval itself must never raise
+            return
+        if exc is None:
+            return  # task returned cleanly (genuine stop)
+        self._log.error(
+            f"Bar stream task for {bar_type} ENDED with {exc!r}; resubscribing"
+        )
+        # Do not resurrect if we are disconnecting or the subscription was removed.
+        if getattr(self, "_is_disconnecting", False):
+            return
+        if self._bar_subscriptions.get(bar_type) is not task:
+            return  # already replaced/unsubscribed
+        try:
+            new_task = self._loop.create_task(
+                self._stream_bars(bar_type, symbol, interval, unit, instrument)
+            )
+            new_task.add_done_callback(
+                lambda t, bt=bar_type, s=symbol, iv=interval, u=unit, inst=instrument: (
+                    self._on_bar_task_done(t, bt, s, iv, u, inst)
+                )
+            )
+            self._bar_subscriptions[bar_type] = new_task
+        except Exception as e:  # noqa: BLE001
+            self._log.error(f"Failed to resubscribe bar stream for {bar_type}: {e!r}")
 
     async def _poll_bars(
         self,
