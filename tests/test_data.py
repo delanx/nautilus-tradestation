@@ -3,13 +3,27 @@ Tests for TradeStation data client parsing helpers.
 
 These tests exercise bar_spec_to_ts_params() and parse_bars() directly via the
 module-level functions in data.py, requiring no live client or network calls.
+TestStreamClientSelection pins the TS_FEED_PROXY constructor seam (I1).
 """
+import asyncio
+from unittest.mock import MagicMock
+
 import pytest
 
 from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.data import bar_spec_to_ts_params, parse_bars
+from nautilus_tradestation.data import (
+    TradeStationDataClient,
+    bar_spec_to_ts_params,
+    parse_bars,
+)
+from nautilus_tradestation.feed.tail_client import FeedTailStreamClient
+from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from nautilus_tradestation.streaming.client import TradeStationStreamClient
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
+from nautilus_trader.model.identifiers import TraderId
 from tests.test_kit import (
     TSTestDataStubs,
     TSTestInstrumentStubs,
@@ -504,3 +518,94 @@ class TestBarParsing:
         bars = parse_bars(raw, bar_type)
         timestamps = [b.ts_event for b in bars]
         assert timestamps == sorted(timestamps)
+
+
+class TestStreamClientSelection:
+    """I1 pin: the TS_FEED_PROXY constructor seam in TradeStationDataClient.
+
+    Flag unset => exactly today's behavior (a direct TradeStationStreamClient
+    with identical construction args); set => FeedTailStreamClient tailing the
+    feed handler's mirror; bad paths/schemes are hard errors at construction.
+    """
+
+    @pytest.fixture
+    def loop(self):
+        loop = asyncio.new_event_loop()
+        yield loop
+        loop.close()
+
+    @staticmethod
+    def _make_client(loop, use_streaming: bool = True) -> TradeStationDataClient:
+        clock = LiveClock()
+        http = MagicMock()
+        http.base_url = "https://sim-api.tradestation.com/v3"
+        return TradeStationDataClient(
+            loop=loop,
+            client=http,
+            msgbus=MessageBus(trader_id=TraderId("TESTER-000"), clock=clock),
+            cache=Cache(),
+            clock=clock,
+            instrument_provider=TradeStationInstrumentProvider(client=http),
+            use_streaming=use_streaming,
+        )
+
+    def test_proxy_unset_builds_direct_stream_client(self, loop, monkeypatch):
+        """TS_FEED_PROXY unset => the direct SSE client, exactly as today."""
+        monkeypatch.delenv("TS_FEED_PROXY", raising=False)
+        client = self._make_client(loop)
+        assert isinstance(client._stream_client, TradeStationStreamClient)
+        assert not isinstance(client._stream_client, FeedTailStreamClient)
+
+    def test_proxy_unset_no_streaming_keeps_none(self, loop, monkeypatch):
+        """use_streaming=False keeps _stream_client None (unchanged)."""
+        monkeypatch.delenv("TS_FEED_PROXY", raising=False)
+        client = self._make_client(loop, use_streaming=False)
+        assert client._stream_client is None
+
+    def test_proxy_set_without_streaming_stays_none(self, loop, tmp_path, monkeypatch):
+        """The seam lives inside use_streaming: the flag alone changes nothing."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        monkeypatch.setenv("TS_FEED_PROXY", f"jsonl:{tmp_path / 'feed' / 'SIM1'}")
+        client = self._make_client(loop, use_streaming=False)
+        assert client._stream_client is None
+
+    def test_proxy_set_builds_tail_client(self, loop, tmp_path, monkeypatch):
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        monkeypatch.setenv("TS_FEED_PROXY", f"jsonl:{tmp_path / 'feed' / 'SIM1'}")
+        client = self._make_client(loop)
+        assert isinstance(client._stream_client, FeedTailStreamClient)
+
+    def test_proxy_factory_builds_direct_client_for_delegation(
+        self, loop, tmp_path, monkeypatch
+    ):
+        """Quote/order/depth delegation lazily builds ONE real SSE client."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        monkeypatch.setenv("TS_FEED_PROXY", f"jsonl:{tmp_path / 'feed' / 'SIM1'}")
+        client = self._make_client(loop)
+        real = client._stream_client._real()
+        assert isinstance(real, TradeStationStreamClient)
+        assert client._stream_client._real() is real
+
+    def test_proxy_non_localappdata_path_is_hard_error(self, loop, tmp_path, monkeypatch):
+        """A feed dir outside %LOCALAPPDATA% (e.g. the Drive mount) is fatal (I4)."""
+        monkeypatch.delenv("TS_FEED_ALLOW_ANY_DIR", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        monkeypatch.setenv("TS_FEED_PROXY", r"jsonl:G:\My Drive\example\feed\SIM1")
+        with pytest.raises(RuntimeError, match="LOCALAPPDATA"):
+            self._make_client(loop)
+
+    def test_proxy_unknown_scheme_is_hard_error(self, loop, monkeypatch):
+        monkeypatch.setenv("TS_FEED_PROXY", "tcp:127.0.0.1:9999")
+        with pytest.raises(RuntimeError, match="unknown scheme"):
+            self._make_client(loop)
+
+    def test_poll_ms_env_plumbing(self, loop, tmp_path, monkeypatch):
+        """TS_FEED_POLL_MS sets the tail poll; TS_FEED_PROXY_POLL_MS overrides."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        monkeypatch.setenv("TS_FEED_PROXY", f"jsonl:{tmp_path / 'feed' / 'SIM1'}")
+        monkeypatch.setenv("TS_FEED_POLL_MS", "50")
+        client = self._make_client(loop)
+        assert client._stream_client._poll_secs == pytest.approx(0.05)
+        monkeypatch.setenv("TS_FEED_PROXY_POLL_MS", "25")
+        client = self._make_client(loop)
+        assert client._stream_client._poll_secs == pytest.approx(0.025)

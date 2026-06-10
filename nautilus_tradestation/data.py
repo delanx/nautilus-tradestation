@@ -3,6 +3,7 @@ TradeStation data client implementation.
 """
 
 import asyncio
+import os
 import time
 from datetime import datetime
 
@@ -99,14 +100,40 @@ class TradeStationDataClient(LiveMarketDataClient):
                 TradeStationStreamClient,
             )
 
-            self._stream_client = TradeStationStreamClient(
-                access_token_provider=lambda: self._client.access_token,
-                access_token_refresher=lambda force_refresh=False: self._client.get_access_token(
-                    force_refresh=force_refresh
-                ),
-                base_url=self._client.base_url,
-                reconnect_delay_secs=streaming_reconnect_delay_secs,
-            )
+            def _mk_real() -> TradeStationStreamClient:
+                return TradeStationStreamClient(
+                    access_token_provider=lambda: self._client.access_token,
+                    access_token_refresher=lambda force_refresh=False: self._client.get_access_token(
+                        force_refresh=force_refresh
+                    ),
+                    base_url=self._client.base_url,
+                    reconnect_delay_secs=streaming_reconnect_delay_secs,
+                )
+
+            feed_proxy = os.environ.get("TS_FEED_PROXY", "")
+            if feed_proxy:
+                # Cell/proxy mode: bar subscriptions tail the account feed
+                # handler's local JSONL mirror instead of opening their own TS
+                # SSE bar streams. FeedTailStreamClient duck-types stream_*, so
+                # everything downstream (_stream_bars supervise loop, the bar
+                # state machine, quote mux) is untouched; quote/order/depth
+                # streams delegate to a lazily built real client.
+                from nautilus_tradestation.feed.tail_client import (
+                    FeedTailStreamClient,
+                )
+
+                self._stream_client = FeedTailStreamClient.from_env(
+                    feed_proxy,
+                    poll_ms=int(
+                        os.environ.get(
+                            "TS_FEED_PROXY_POLL_MS",
+                            os.environ.get("TS_FEED_POLL_MS", "100"),
+                        )
+                    ),
+                    real_client_factory=_mk_real,
+                )
+            else:
+                self._stream_client = _mk_real()
 
         # Bar subscription state
         self._bar_subscriptions: dict[BarType, asyncio.Task] = {}
