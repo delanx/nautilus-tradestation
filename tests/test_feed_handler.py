@@ -1,11 +1,14 @@
 """
 Tests for feed/handler.py — FeedHandler end-to-end with a fake SSE source:
-publish -> subscribe -> replay -> dedup, request discovery, key-mismatch
-quarantine, heartbeat, planned stop, retention sweep.
+publish -> subscribe -> replay -> dedup, request discovery, key-mismatch and
+payload-conflict quarantine, single-writer lock, ingest-health heartbeat,
+key retirement, planned stop, retention sweep.
 """
 import asyncio
 import os
 import time
+
+import pytest
 
 from nautilus_tradestation.feed import protocol
 from nautilus_tradestation.feed.handler import FeedHandler
@@ -108,25 +111,28 @@ class TestEndToEnd:
             manifest_path = feed_dir / protocol.BARS_DIR / KEY / protocol.MANIFEST_NAME
             await wait_until(lambda: (protocol.read_json(manifest_path) or {}).get("join"))
 
-            # SUBSCRIBE: two cells tail the same key.
+            # SUBSCRIBE: two cells tail the same key. Fresh start = seed +
+            # tail-from-end: T+1's PRE-subscribe update is NOT replayed
+            # (direct-connect parity; a stale replay would break G1).
             client_a = FeedTailStreamClient(feed_dir, poll_ms=10)
             client_b = FeedTailStreamClient(feed_dir, poll_ms=10)
             gen_a = client_a.stream_bars("ESM26", "15", "Minute")
             gen_b = client_b.stream_bars("ESM26", "15", "Minute")
-            got_a = await collect(gen_a, 2)  # seed (T's final update) + T+1's first
-            got_b = await collect(gen_b, 2)
-            assert got_a == got_b
-            assert got_a[0]["Status"] == "Historical"
-            assert got_a[0]["_ts_feed_seed"] is True
-            assert got_a[0]["TimeStamp"] == "2026-06-10T14:00:00Z"
-            assert got_a[0]["Close"] == "4121.5"
-            assert got_a[1] == _ev("2026-06-10T14:15:00Z", "4122.0")
+            task_a = asyncio.create_task(collect(gen_a, 2))
+            task_b = asyncio.create_task(collect(gen_b, 2))
+            await asyncio.sleep(0.1)  # seeds yielded; both attached at the tail
 
             # PUBLISH live: a pushed update reaches both subscribers verbatim.
             live = _ev("2026-06-10T14:15:00Z", "4123.0")
             fake.queue.put_nowait(live)
-            assert (await collect(gen_a, 1))[0] == live
-            assert (await collect(gen_b, 1))[0] == live
+            got_a = await task_a
+            got_b = await task_b
+            assert got_a == got_b
+            assert got_a[0]["Status"] == "Historical"
+            assert got_a[0]["_ts_feed_seed"] is True
+            assert got_a[0]["TimeStamp"] == "2026-06-10T14:00:00Z"  # seed = T's final update
+            assert got_a[0]["Close"] == "4121.5"
+            assert got_a[1] == live  # T+1's pre-subscribe update was not replayed
 
             # DEDUP: three request drops (hand + two cells) -> ONE upstream stream.
             assert fake.calls == [("ESM26", "15", "Minute", None)]
@@ -170,6 +176,161 @@ class TestEndToEnd:
             assert bogus.with_name(f"{bogus.name}.bad").exists()
             assert not (feed_dir / protocol.BARS_DIR / "BOGUS").exists()
             assert fake.calls == []  # never ingested
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+
+class TestSingleWriterLock:
+    async def test_second_handler_refused_and_lock_dies_with_owner(self, tmp_path, monkeypatch):
+        # Two concurrent handlers would interleave appends with independent seq
+        # counters (consumers silently drop the forks as dedup = missed bars).
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        h1 = make_handler(tmp_path, FakeStreamClient())
+        t1 = asyncio.create_task(h1.run())
+        feed_dir = tmp_path / "SIMTEST"
+        try:
+            await wait_until((feed_dir / protocol.META_NAME).exists)
+            h2 = make_handler(tmp_path, FakeStreamClient())
+            with pytest.raises(RuntimeError, match="handler.lock"):
+                await h2.run()
+        finally:
+            t1.cancel()
+            await asyncio.gather(t1, return_exceptions=True)
+        # The lock died with the first handler: a successor starts cleanly.
+        h3 = make_handler(tmp_path, FakeStreamClient())
+        t3 = asyncio.create_task(h3.run())
+        try:
+            heartbeat = feed_dir / protocol.HEARTBEAT_NAME
+            before = os.stat(heartbeat).st_mtime
+            await wait_until(lambda: os.stat(heartbeat).st_mtime > before)
+            assert not t3.done()
+        finally:
+            t3.cancel()
+            await asyncio.gather(t3, return_exceptions=True)
+
+
+class TestIngestHealth:
+    async def test_heartbeat_freezes_while_mirror_io_fails_then_recovers(
+        self, tmp_path, monkeypatch
+    ):
+        # Disk-full class: appends fail but the process is alive. The heartbeat
+        # must FREEZE (cells read silence as handler-dead, never quiet market)
+        # and thaw on the next successful append.
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        fake = FakeStreamClient()
+        handler = make_handler(tmp_path, fake)
+        run_task = asyncio.create_task(handler.run())
+        feed_dir = tmp_path / "SIMTEST"
+        try:
+            write_request(feed_dir, "ESM26", "15", "Minute", None)
+            fake.queue.put_nowait(_ev("2026-06-10T14:00:00Z", "4120.0"))
+            await wait_until(lambda: KEY in handler._ingests and handler._ingests[KEY].cur_ts)
+            st = handler._ingests[KEY]
+            real_append = st.writer.append
+            broken = {"on": True}
+
+            def flaky_append(ev):
+                if broken["on"]:
+                    raise OSError("disk full")
+                return real_append(ev)
+
+            monkeypatch.setattr(st.writer, "append", flaky_append)
+            fake.queue.put_nowait(_ev("2026-06-10T14:00:00Z", "4121.0"))
+            await wait_until(lambda: KEY in handler._mirror_io_errors)
+            heartbeat = feed_dir / protocol.HEARTBEAT_NAME
+            frozen = os.stat(heartbeat).st_mtime
+            await asyncio.sleep(0.2)  # many heartbeat cadences (0.02s each)
+            assert os.stat(heartbeat).st_mtime == frozen  # FROZEN, not green
+            # IO recovers: the next successful append thaws the heartbeat.
+            broken["on"] = False
+            fake.queue.put_nowait(_ev("2026-06-10T14:00:00Z", "4122.0"))
+            await wait_until(lambda: KEY not in handler._mirror_io_errors, timeout=10.0)
+            await wait_until(lambda: os.stat(heartbeat).st_mtime > frozen, timeout=10.0)
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+
+class TestKeyRetirement:
+    async def test_stale_lease_retires_ingest_and_resubscribes_on_return(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        fake = FakeStreamClient()
+        handler = make_handler(tmp_path, fake, request_ttl_secs=0.2)
+        run_task = asyncio.create_task(handler.run())
+        feed_dir = tmp_path / "SIMTEST"
+        req = feed_dir / protocol.REQUESTS_DIR / f"{KEY}{protocol.REQUEST_SUFFIX}"
+        try:
+            write_request(feed_dir, "ESM26", "15", "Minute", None)
+            await wait_until(lambda: KEY in handler._ingests)
+            assert len(fake.calls) == 1
+            # No cell re-stamps the lease: past the TTL the key is retired
+            # (upstream subscription dropped, writer closed, lease deleted).
+            old = time.time() - 5.0
+            os.utime(req, (old, old))
+            await wait_until(lambda: KEY not in handler._ingests)
+            assert KEY not in handler._ingest_tasks
+            assert not req.exists()
+            # A cell coming back re-leases and gets a fresh ingest.
+            write_request(feed_dir, "ESM26", "15", "Minute", None)
+            await wait_until(lambda: KEY in handler._ingests)
+            await wait_until(lambda: len(fake.calls) == 2)  # upstream re-subscribed
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    async def test_stale_leftover_request_never_subscribed(self, tmp_path, monkeypatch):
+        # Handler restart finding a retired pod's leftover lease: never re-open
+        # an upstream TS SSE subscription for it.
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        fake = FakeStreamClient()
+        feed_dir = tmp_path / "SIMTEST"
+        key = write_request(feed_dir, "ESM26", "15", "Minute", None)
+        req = feed_dir / protocol.REQUESTS_DIR / f"{key}{protocol.REQUEST_SUFFIX}"
+        old = time.time() - 5.0
+        os.utime(req, (old, old))
+        handler = make_handler(tmp_path, fake, request_ttl_secs=0.2)
+        run_task = asyncio.create_task(handler.run())
+        try:
+            await wait_until(lambda: not req.exists())
+            assert fake.calls == []
+            assert key not in handler._ingests
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    async def test_conflicting_payload_for_running_key_quarantined(self, tmp_path, monkeypatch):
+        # Defense in depth behind the key hash: a request whose key another
+        # stream already owns is quarantined + alerted, never silently absorbed
+        # (the conflicting subscriber would otherwise tail the WRONG symbol).
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        fake = FakeStreamClient()
+        handler = make_handler(tmp_path, fake)
+        run_task = asyncio.create_task(handler.run())
+        feed_dir = tmp_path / "SIMTEST"
+        req = feed_dir / protocol.REQUESTS_DIR / f"{KEY}{protocol.REQUEST_SUFFIX}"
+        try:
+            write_request(feed_dir, "ESM26", "15", "Minute", None)
+            await wait_until(lambda: KEY in handler._ingests)
+            # Tamper: same key file, different semantic payload.
+            protocol.write_json_atomic(req, {
+                "v": 1,
+                "symbol": "NQM26",
+                "interval": "15",
+                "unit": "Minute",
+                "session_template": None,
+                "requested_by": 1234,
+                "ts_utc": "2026-06-10T00:00:00+00:00",
+            })
+            await wait_until(lambda: req.with_name(f"{req.name}.bad").exists())
+            alert = tmp_path / "alerts" / f"feed_request_conflict_SIMTEST_{KEY}.json"
+            await wait_until(alert.exists)
+            # The running ingest is untouched; the conflicting cell is NOT served.
+            assert KEY in handler._ingests
+            assert handler._ingests[KEY].symbol == "ESM26"
+            assert fake.calls == [("ESM26", "15", "Minute", None)]
         finally:
             run_task.cancel()
             await asyncio.gather(run_task, return_exceptions=True)

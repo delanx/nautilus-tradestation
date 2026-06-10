@@ -9,18 +9,23 @@ produce IDENTICAL emitted Bar lists whether fed
 
 The sequence exercises all three Historical-seed branches (same-ts
 correction, stale-ignore, gap-fill), a mid-sequence consumer reconnect
-(resume replay), the late-subscriber fresh start (manifest seed + join),
-and ts_init precedence (_ts_bar_emit_ns stamped at the CELL wins over the
-handler's _ts_sse_received_ns — I6).
+(resume replay), the late-subscriber fresh start (manifest seed +
+tail-from-end), the STALE-START class (idle/pre-open subscribe, handler
+restart, FeedGapError fresh start on an initialized machine — the proxy must
+never emit a prior bar a direct node would not), and ts_init precedence
+(_ts_bar_emit_ns stamped at the CELL wins over the handler's
+_ts_sse_received_ns — I6).
 """
 import asyncio
 import time
+
+import pytest
 
 from nautilus_tradestation.data import TradeStationDataClient
 from nautilus_tradestation.feed import protocol
 from nautilus_tradestation.feed.handler import FeedHandler
 from nautilus_tradestation.feed.keys import stream_key
-from nautilus_tradestation.feed.tail_client import FeedTailStreamClient
+from nautilus_tradestation.feed.tail_client import FeedGapError, FeedTailStreamClient
 from nautilus_trader.model.data import BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
 from tests.test_kit import TSTestInstrumentStubs
@@ -228,8 +233,10 @@ class TestG1Differential:
         assert_bars_identical(direct.emitted, proxy.emitted, t0_ns)
 
     async def test_late_subscriber_seed_parity(self, tmp_path, monkeypatch):
-        """A cell connecting after history: the manifest seed + join replay
-        drive the state machine exactly like a direct-mode connect seed."""
+        """A cell connecting mid-session: the manifest seed + ONLY the events
+        appended after attach drive the state machine exactly like a
+        direct-mode connect (bar E's PRE-subscribe update is not replayed —
+        a direct connect would not have it either)."""
         monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
         t0_ns = time.time_ns()
         handler, st, feed_dir = make_mirror(tmp_path)
@@ -238,7 +245,14 @@ class TestG1Differential:
 
         client = FeedTailStreamClient(feed_dir, poll_ms=10)
         gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 2)  # seed + join replay of bar E's first update
+        task = asyncio.create_task(collect(gen, 3))
+        await asyncio.sleep(0.05)  # seed yielded; consumer attached at the tail
+        live_e = _ev(TE, "4125.75", "4126.75", "4125.50", "4126.25", "180")  # bar E update
+        live_f = _ev(TF, "4126.25", "4126.75", "4126.00", "4126.50", "150")  # closes E
+        ingest(handler, st, live_e)
+        ingest(handler, st, live_f)
+        got = await task
+        await gen.aclose()
 
         # The synthesized seed is bar D's FINAL update, re-stamped Historical
         # (what TS barsback=1 would send a fresh direct connection).
@@ -247,18 +261,155 @@ class TestG1Differential:
         assert seed["_ts_feed_seed"] is True
         assert seed["TimeStamp"] == TD
         assert seed["Close"] == "4125.75"
-        assert got[1] == SEQUENCE[-1]  # bar E's first (and only) update so far
-
-        live = _ev(TF, "4126.00", "4126.75", "4125.75", "4126.50", "150")
-        ingest(handler, st, live)
-        got += await collect(gen, 1)
-        await gen.aclose()
+        assert got[1:] == [live_e, live_f]  # bar E's pre-subscribe update NOT replayed
 
         # Direct equivalent: the same connect-time seed, then the same events.
-        direct = run_direct([dict(seed), SEQUENCE[-1], live])
+        direct = run_direct([dict(seed), live_e, live_f])
         proxy = CellHarness()
         for ev in got:
             proxy.feed(ev)
         # Both: seed skipped cold (initialized=False), bar E closes at TF.
-        assert [str(b.close) for b in direct.emitted] == ["4126.00"]
+        assert [str(b.close) for b in direct.emitted] == ["4126.25"]
+        assert_bars_identical(direct.emitted, proxy.emitted, t0_ns)
+
+    async def test_fresh_subscribe_during_idle_emits_no_stale_session_bar(
+        self, tmp_path, monkeypatch
+    ):
+        """G1 at the fleet's mandated restart window: a cell subscribing during
+        an idle stretch (overnight/pre-open) must NOT replay the previous
+        session's final bar M — the state machine would emit it as a live
+        closed bar at the next session's first event, which a direct node
+        connecting at the same instant never does."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        handler, st, feed_dir = make_mirror(tmp_path)
+        session = [
+            _ev(TA, "4118.00", "4120.50", "4117.50", "4120.25", "300"),
+            _ev(TA, "4118.00", "4121.75", "4117.50", "4121.50", "640"),
+            _ev(TB, "4121.75", "4123.50", "4121.00", "4123.25", "480"),  # final bar M...
+            _ev(TB, "4121.75", "4123.75", "4121.00", "4123.50", "510"),  # ...close unconfirmed
+        ]
+        for ev in session:
+            ingest(handler, st, ev)
+
+        client = FeedTailStreamClient(feed_dir, poll_ms=10)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 2))
+        await asyncio.sleep(0.05)  # idle subscribe: seed yielded, attached at the tail
+        nxt = _ev(TC, "4123.50", "4125.00", "4122.75", "4124.00", "880")  # next session opens
+        ingest(handler, st, nxt)
+        got = await task
+        await gen.aclose()
+
+        assert got[0]["_ts_feed_seed"] is True
+        assert got[0]["TimeStamp"] == TA  # seed = last PROVEN-complete bar
+        assert got[1:] == [nxt]  # bar M's updates were NOT replayed
+
+        proxy = CellHarness()
+        for ev in got:
+            proxy.feed(ev)
+        # A direct node connecting at the same instant: connect seed + next event.
+        direct = run_direct([dict(got[0]), nxt])
+        assert direct.emitted == []  # nothing emitted for the prior session's bar
+        assert proxy.emitted == []  # G1: the proxy matches
+
+    async def test_handler_restart_idle_subscribe_with_reconnect_seed(
+        self, tmp_path, monkeypatch
+    ):
+        """Pre-open handler restart: the restored manifest join points at the
+        previous session's final bar M, and upstream's reconnect Historical
+        seed Y (ts > M) lands in the stream. The proxy must emit NEITHER M nor
+        Y — exactly a direct cold connect (seed skipped, next bar initializes)."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        handler, st, feed_dir = make_mirror(tmp_path)
+        session = [
+            _ev(TA, "4118.00", "4120.50", "4117.50", "4120.25", "300"),
+            _ev(TB, "4121.75", "4123.50", "4121.00", "4123.25", "480"),  # bar M, unconfirmed
+        ]
+        for ev in session:
+            ingest(handler, st, ev)
+        st.writer.close()  # handler stops overnight
+
+        handler2 = FeedHandler("SIMTEST", tmp_path, None)  # pre-open restart
+        st2 = handler2._start_ingest(KEY, "ESM26", "15", "Minute", None)
+
+        client = FeedTailStreamClient(feed_dir, poll_ms=10)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 3))
+        await asyncio.sleep(0.05)  # subscribed before upstream reconnects
+
+        seed_y = _ev(TB, "4121.75", "4123.75", "4121.00", "4123.50", "520", status="Historical")
+        ingest(handler2, st2, seed_y)  # rule (a): bar M completed during the idle
+        nxt = _ev(TC, "4123.50", "4125.00", "4122.75", "4124.00", "880")
+        ingest(handler2, st2, nxt)
+        got = await task
+        await gen.aclose()
+
+        assert got[0]["_ts_feed_seed"] is True
+        assert got[0]["TimeStamp"] == TA  # restored manifest seed (last proven close)
+        assert got[1:] == [seed_y, nxt]  # M's RealTime updates were NOT replayed
+
+        proxy = CellHarness()
+        for ev in got:
+            proxy.feed(ev)
+        direct = run_direct([dict(got[0]), seed_y, nxt])
+        assert direct.emitted == []  # neither M nor Y emitted
+        assert proxy.emitted == []
+        st2.writer.close()
+
+    async def test_gap_error_fresh_start_initialized_no_out_of_order(
+        self, tmp_path, monkeypatch
+    ):
+        """FeedGapError recovery on an INITIALIZED state machine: the fresh
+        start must deliver only (manifest seed + post-attach events) — no
+        stale RealTime replay that would emit out of order. The loss bound is
+        a direct-mode SSE outage: the buffered bar emits with its last SEEN
+        update at the next bar's first event."""
+        monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
+        t0_ns = time.time_ns()
+        handler, st, feed_dir = make_mirror(tmp_path)
+        client = FeedTailStreamClient(feed_dir, poll_ms=10)
+        proxy = CellHarness()
+
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 3))
+        await asyncio.sleep(0.05)
+        pre = [
+            _ev(TA, "4118.00", "4120.50", "4117.50", "4120.25", "300"),
+            _ev(TA, "4118.00", "4121.75", "4117.50", "4121.50", "640"),
+            _ev(TB, "4121.75", "4123.50", "4121.00", "4123.25", "480"),  # bar B in progress
+        ]
+        for ev in pre:
+            ingest(handler, st, ev)
+        for ev in await task:
+            proxy.feed(ev)  # the proxy is now INITIALIZED mid-bar B
+
+        # A bar-B update never reaches the consumer intact: forge a seq gap.
+        seg_path = st.writer.key_dir / protocol.segment_name(st.writer.active_segment)
+        lost = _ev(TB, "4121.75", "4123.75", "4121.00", "4123.50", "510")
+        with open(seg_path, "ab") as f:
+            f.write(protocol.encode_event_line(st.writer.seq_highwater + 2, lost))
+        with pytest.raises(FeedGapError):
+            await gen.__anext__()
+        await gen.aclose()
+
+        # Supervise re-entry: FRESH START on the same (initialized) machine.
+        gen2 = client.stream_bars("ESM26", "15", "Minute")
+        task2 = asyncio.create_task(collect(gen2, 2))
+        await asyncio.sleep(0.05)
+        nxt = _ev(TC, "4123.50", "4125.00", "4122.75", "4124.00", "880")
+        ingest(handler, st, nxt)
+        got2 = await task2
+        await gen2.aclose()
+
+        assert got2[0]["_ts_feed_seed"] is True
+        assert got2[0]["TimeStamp"] == TA  # seed = last proven-complete bar
+        assert got2[1:] == [nxt]  # nothing stale replayed
+        for ev in got2:
+            proxy.feed(ev)
+
+        # Direct node across the same outage: pre-gap events, reconnect seed,
+        # next bar. The stale seed is ignored; bar B emits with its last SEEN
+        # update; nothing emits out of order.
+        direct = run_direct(pre + [dict(got2[0]), nxt])
+        assert [str(b.close) for b in direct.emitted] == ["4121.50", "4123.25"]
         assert_bars_identical(direct.emitted, proxy.emitted, t0_ns)

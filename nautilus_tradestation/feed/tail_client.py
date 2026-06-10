@@ -70,6 +70,7 @@ class FeedTailStreamClient:
         subscribe_timeout_secs: float = 30.0,
         idle_check_secs: float = 10.0,
         heartbeat_stale_secs: float = 15.0,
+        request_refresh_secs: float = protocol.REQUEST_REFRESH_SECS,
     ) -> None:
         self._feed_dir = Path(feed_dir)
         self._poll_secs = max(int(poll_ms), 1) / 1000.0
@@ -78,6 +79,7 @@ class FeedTailStreamClient:
         self._subscribe_timeout_secs = subscribe_timeout_secs
         self._idle_check_secs = idle_check_secs
         self._heartbeat_stale_secs = heartbeat_stale_secs
+        self._request_refresh_secs = request_refresh_secs
         # key -> (segment, offset, last_seq); set once the first event of a
         # stream is consumed, cleared on a seq gap (fresh-start fallback).
         self._cursors: dict[str, tuple[int, int, int]] = {}
@@ -144,13 +146,14 @@ class FeedTailStreamClient:
                 f"feed resume for {key}: segment={segment} offset={offset} last_seq={last_seq}"
             )
         else:
-            # FRESH START: seed (if any) once, then tail from the join point.
+            # FRESH START: seed (if any) once, then tail from the end.
             seed = manifest.get("seed_event")
             if isinstance(seed, dict):
                 yield dict(seed, _ts_feed_seed=True)
-            segment, offset, last_seq = self._fresh_start_position(key, key_dir, manifest)
+            segment, offset, last_seq = self._fresh_start_position(key, key_dir)
 
         idle_since = time.monotonic()
+        last_lease = time.monotonic()
         while True:
             seg_path = key_dir / protocol.segment_name(segment)
             try:
@@ -240,6 +243,11 @@ class FeedTailStreamClient:
                             f"{key} idle ({self._feed_dir})"
                         )
                     idle_since = time.monotonic()  # alive but quiet: re-check periodically
+            if time.monotonic() - last_lease >= self._request_refresh_secs:
+                # The request file is a lease: re-stamp it so the handler can
+                # retire keys NO live cell wants (protocol.REQUEST_TTL_SECS).
+                self._write_request(key, symbol, interval, unit, session_template)
+                last_lease = time.monotonic()
             await asyncio.sleep(self._poll_secs)
 
     # -- OTHER STREAMS (delegated to the real client) ---------------------------
@@ -271,8 +279,10 @@ class FeedTailStreamClient:
     def _write_request(
         self, key: str, symbol: str, interval: str, unit: str, session_template: str | None
     ) -> None:
-        """Drop the subscription request (idempotent; cross-cell collisions are
-        benign — identical semantic content)."""
+        """Drop/refresh the subscription request (idempotent; cross-cell
+        collisions are benign — identical semantic content). Re-stamped every
+        ``request_refresh_secs`` while streaming: the file doubles as the
+        liveness lease the handler's key retirement checks."""
         requests_dir = self._feed_dir / protocol.REQUESTS_DIR
         requests_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -300,32 +310,21 @@ class FeedTailStreamClient:
                 )
             await asyncio.sleep(self._poll_secs)
 
-    def _fresh_start_position(
-        self, key: str, key_dir: Path, manifest: dict
-    ) -> tuple[int, int, int | None]:
+    def _fresh_start_position(self, key: str, key_dir: Path) -> tuple[int, int, int | None]:
         """Resolve the (segment, offset, last_seq) a fresh subscriber tails from.
 
-        Prefer ``manifest.join`` (the first event of the current in-progress
-        bar) so the consumer's buffer converges on the current bar. With no
-        join (no completed bar since handler start) tail from the end of the
-        newest segment — same net behavior as direct mode, where the connect
-        seed is skipped anyway.
+        ALWAYS the end of the newest segment — exact direct-connect parity:
+        the manifest seed (yielded by the caller) plays TS's barsback=1
+        connect seed, and the unchanged bar state machine initializes on the
+        first event that arrives AFTER subscribe, exactly like a direct SSE
+        connect. ``manifest.join`` is deliberately NOT replayed: every SSE
+        update is a full bar snapshot, so join replay adds nothing a direct
+        connect would have — and a STALE join (subscribing during an idle
+        stretch, e.g. overnight/pre-open, where the final bar's close was
+        never confirmed) would replay the previous session's last bar into
+        the state machine, which then emits it as a live closed bar at the
+        next session's first event (a G1 break a direct node never shows).
         """
-        join = manifest.get("join")
-        if isinstance(join, dict):
-            try:
-                segment = int(join["segment"])
-                offset = int(join["offset"])
-                seq = int(join["seq"])
-            except (KeyError, TypeError, ValueError):
-                segment = -1
-            if segment > 0:
-                if (key_dir / protocol.segment_name(segment)).exists():
-                    return segment, offset, seq - 1
-                _log.error(
-                    f"feed fresh-start for {key}: join segment {segment} is gone; "
-                    "tailing from the end of the newest segment instead"
-                )
         segments = protocol.list_segments(key_dir)
         if not segments:
             return 1, 0, None
@@ -341,5 +340,13 @@ class FeedTailStreamClient:
             chunk = f.read()
         base = size - len(chunk)
         cut = chunk.rfind(b"\n")
-        offset = base + cut + 1 if cut >= 0 else base
-        return segment, offset, None
+        if cut < 0:
+            return segment, base, None
+        # A pending roll line (writer crashed between the roll write and the
+        # next segment's creation) must be followed, not attached BEHIND:
+        # appends resume in the roll target, never in this segment.
+        start = chunk.rfind(b"\n", 0, cut)
+        decoded = protocol.decode_line(chunk[start + 1 : cut])
+        if decoded[0] == protocol.ROLL:
+            return decoded[1], 0, None
+        return segment, base + cut + 1, None

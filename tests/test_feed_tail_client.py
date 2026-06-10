@@ -1,7 +1,8 @@
 """
 Tests for feed/tail_client.py — FeedTailStreamClient: string preservation,
-fresh start (seed + join), resume replay, gap hard-error, heartbeat liveness,
-segment rolls, subscribe timeout, delegation.
+fresh start (seed + tail-from-end; manifest.join is NEVER replayed), resume
+replay, gap hard-error, heartbeat liveness, segment rolls, subscribe timeout,
+request-lease refresh, delegation.
 """
 import asyncio
 import os
@@ -128,14 +129,14 @@ class TestStringPreservation:
     async def test_events_cross_verbatim(self, tmp_path):
         # I2: TimeStamp/OHLCV remain the exact strings TS sent — never re-typed.
         feed_dir, key_dir, writer = make_feed(tmp_path)
-        ev = _ev("2026-06-10T14:30:00Z", close="4123.25")
-        seq, seg, off = writer.append(ev)
-        writer.write_manifest(
-            seed_event=None, join=(seg, off, seq), last_close_ts=""
-        )
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         client = make_client(feed_dir)
         gen = client.stream_bars("ESM26", "15", "Minute")
-        got = (await collect(gen, 1))[0]
+        task = asyncio.create_task(collect(gen, 1))
+        await asyncio.sleep(0.1)  # consumer attaches at the tail
+        ev = _ev("2026-06-10T14:30:00Z", close="4123.25")
+        writer.append(ev)
+        got = (await task)[0]
         await gen.aclose()
         assert got == ev
         for field in ("TimeStamp", "Open", "High", "Low", "Close", "TotalVolume"):
@@ -146,21 +147,46 @@ class TestStringPreservation:
 
 
 class TestFreshStart:
-    async def test_seed_yielded_once_then_join_tail(self, tmp_path):
+    async def test_seed_yielded_once_then_tail_from_end(self, tmp_path):
+        # Fresh start = manifest seed + ONLY events appended after attach. The
+        # current bar's pre-attach updates are NOT replayed: every SSE update
+        # is a full snapshot, so a direct connect would not have them either.
         feed_dir, key_dir, writer = make_feed(tmp_path)
         seed = _ev("2026-06-10T14:15:00Z", status="Historical")
-        current = _ev("2026-06-10T14:30:00Z", marker=1)
-        seq, seg, off = writer.append(current)
-        writer.write_manifest(
-            seed_event=seed, join=(seg, off, seq), last_close_ts=seed["TimeStamp"]
-        )
+        pre = _ev("2026-06-10T14:30:00Z", marker=1)  # current bar, before attach
+        writer.append(pre)
+        writer.write_manifest(seed_event=seed, join=None, last_close_ts=seed["TimeStamp"])
         client = make_client(feed_dir)
         gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 2)
+        task = asyncio.create_task(collect(gen, 2))
+        await asyncio.sleep(0.15)  # seed yielded; consumer attached at the tail
+        live = _ev("2026-06-10T14:30:00Z", marker=2)
+        writer.append(live)
+        got = await task
         await gen.aclose()
         assert got[0] == dict(seed, _ts_feed_seed=True)
         assert got[0]["Status"] == "Historical"
-        assert got[1] == current
+        assert got[1] == live  # the pre-attach update never replayed
+        writer.close()
+
+    async def test_stale_join_in_manifest_is_never_replayed(self, tmp_path):
+        # G1: a manifest join pointing at the previous session's final bar
+        # (idle stretch / pre-open restart) must NOT be replayed — replaying
+        # it would make the state machine emit yesterday's bar as a live
+        # closed bar at today's first event, which a direct node never does.
+        feed_dir, key_dir, writer = make_feed(tmp_path)
+        seq, seg, off = writer.append(_ev("2026-06-09T20:45:00Z", marker=1))
+        writer.append(_ev("2026-06-09T20:45:00Z", marker=2))
+        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 1))
+        await asyncio.sleep(0.15)
+        nxt = _ev("2026-06-10T13:30:00Z", marker=3)
+        writer.append(nxt)
+        got = await task
+        await gen.aclose()
+        assert got == [nxt]  # yesterday's bar updates were not replayed
         writer.close()
 
     async def test_null_join_tails_from_end(self, tmp_path):
@@ -178,6 +204,28 @@ class TestFreshStart:
         await gen.aclose()
         assert got == [late]  # pre-attach events were skipped, like direct mode
         writer.close()
+
+    async def test_fresh_start_follows_pending_roll_line(self, tmp_path):
+        # Crash window: the newest segment ends with a roll line but the next
+        # segment was never created. A fresh subscriber must attach at the
+        # roll TARGET, not behind the roll line (no append can ever land there).
+        feed_dir = tmp_path / "SIMTEST"
+        key_dir = feed_dir / protocol.BARS_DIR / KEY
+        key_dir.mkdir(parents=True)
+        touch_heartbeat(feed_dir)
+        with open(key_dir / protocol.segment_name(1), "wb") as f:
+            f.write(protocol.encode_event_line(1, _ev("2026-06-10T14:00:00Z", marker=1)))
+            f.write(protocol.encode_roll_line(2))
+        write_manifest_raw(key_dir, active_segment=1, seq_highwater=1)
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 1))
+        await asyncio.sleep(0.15)
+        with open(key_dir / protocol.segment_name(2), "wb") as f:
+            f.write(protocol.encode_event_line(2, _ev("2026-06-10T14:00:00Z", marker=2)))
+        got = await task
+        await gen.aclose()
+        assert [ev["_marker"] for ev in got] == [2]
 
     async def test_request_file_written(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path)
@@ -203,14 +251,16 @@ class TestFreshStart:
 class TestResume:
     async def test_resume_replays_exactly_once_in_order(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path)
-        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 6)]
-        positions = [writer.append(ev) for ev in events]
-        seq, seg, off = positions[0]
-        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         client = make_client(feed_dir)
 
         gen1 = client.stream_bars("ESM26", "15", "Minute")
-        first = await collect(gen1, 2)
+        task = asyncio.create_task(collect(gen1, 2))
+        await asyncio.sleep(0.1)  # consumer attaches at the tail
+        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 6)]
+        for ev in events:
+            writer.append(ev)
+        first = await task
         await gen1.aclose()  # kill the generator mid-stream
         assert first == events[:2]
         assert KEY in client._cursors
@@ -229,15 +279,17 @@ class TestResume:
         # Retention falloff: the cursor's segment was deleted while the
         # generator was down -> FeedGapError, cursor cleared, fresh start next.
         feed_dir, key_dir, writer = make_feed(tmp_path, segment_max_bytes=1)
-        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 4)]
-        positions = [writer.append(ev) for ev in events]
-        seq, seg, off = positions[0]
         seed = _ev("2026-06-10T13:45:00Z", status="Historical")
-        writer.write_manifest(seed_event=seed, join=(seg, off, seq), last_close_ts="")
+        writer.write_manifest(seed_event=seed, join=None, last_close_ts="")
         client = make_client(feed_dir)
 
         gen1 = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen1, 3)  # seed + events 1-2; cursor lands in segment 2
+        task = asyncio.create_task(collect(gen1, 3))
+        await asyncio.sleep(0.1)  # seed yielded; consumer attached at the tail
+        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 4)]
+        for ev in events:
+            writer.append(ev)
+        got = await task  # seed + events 1-2; cursor lands in segment 2
         await gen1.aclose()
         assert got[0] == dict(seed, _ts_feed_seed=True)
         assert got[1:] == events[:2]
@@ -265,19 +317,16 @@ class TestGapHardError:
         key_dir.mkdir(parents=True)
         touch_heartbeat(feed_dir)
         seed = _ev("2026-06-10T13:45:00Z", status="Historical")
+        write_manifest_raw(key_dir, seq_highwater=5, seed_event=seed)
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 3))
+        await asyncio.sleep(0.1)  # attach on the still-empty key dir (segment 1, offset 0)
         with open(key_dir / protocol.segment_name(1), "wb") as f:
             f.write(protocol.encode_event_line(1, _ev("2026-06-10T14:00:00Z", marker=1)))
             f.write(protocol.encode_event_line(2, _ev("2026-06-10T14:00:00Z", marker=2)))
             f.write(protocol.encode_event_line(5, _ev("2026-06-10T14:00:00Z", marker=5)))
-        write_manifest_raw(
-            key_dir,
-            seq_highwater=5,
-            seed_event=seed,
-            join={"segment": 1, "offset": 0, "seq": 1},
-        )
-        client = make_client(feed_dir)
-        gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 3)  # seed + seq 1 + seq 2
+        got = await task  # seed + seq 1 + seq 2
         assert [ev.get("_marker") for ev in got] == [None, 1, 2]
         with pytest.raises(FeedGapError):
             await gen.__anext__()
@@ -293,15 +342,17 @@ class TestGapHardError:
         key_dir = feed_dir / protocol.BARS_DIR / KEY
         key_dir.mkdir(parents=True)
         touch_heartbeat(feed_dir)
+        write_manifest_raw(key_dir, seq_highwater=3)
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 3))
+        await asyncio.sleep(0.1)
         with open(key_dir / protocol.segment_name(1), "wb") as f:
             f.write(protocol.encode_event_line(1, _ev("2026-06-10T14:00:00Z", marker=1)))
             f.write(protocol.encode_event_line(2, _ev("2026-06-10T14:00:00Z", marker=2)))
             f.write(protocol.encode_event_line(2, _ev("2026-06-10T14:00:00Z", marker=99)))
             f.write(protocol.encode_event_line(3, _ev("2026-06-10T14:00:00Z", marker=3)))
-        write_manifest_raw(key_dir, seq_highwater=3, join={"segment": 1, "offset": 0, "seq": 1})
-        client = make_client(feed_dir)
-        gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 3)
+        got = await task
         await gen.aclose()
         assert [ev["_marker"] for ev in got] == [1, 2, 3]  # the duplicate never surfaces
 
@@ -310,14 +361,16 @@ class TestGapHardError:
         key_dir = feed_dir / protocol.BARS_DIR / KEY
         key_dir.mkdir(parents=True)
         touch_heartbeat(feed_dir)
+        write_manifest_raw(key_dir, seq_highwater=2)
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 2))
+        await asyncio.sleep(0.1)
         with open(key_dir / protocol.segment_name(1), "wb") as f:
             f.write(protocol.encode_event_line(1, _ev("2026-06-10T14:00:00Z", marker=1)))
             f.write(b"this is not json\n")
             f.write(protocol.encode_event_line(2, _ev("2026-06-10T14:00:00Z", marker=2)))
-        write_manifest_raw(key_dir, seq_highwater=2, join={"segment": 1, "offset": 0, "seq": 1})
-        client = make_client(feed_dir)
-        gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 2)
+        got = await task
         await gen.aclose()
         assert [ev["_marker"] for ev in got] == [1, 2]
 
@@ -326,14 +379,16 @@ class TestGapHardError:
         key_dir = feed_dir / protocol.BARS_DIR / KEY
         key_dir.mkdir(parents=True)
         touch_heartbeat(feed_dir)
+        write_manifest_raw(key_dir, seq_highwater=3)
+        client = make_client(feed_dir)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 1))
+        await asyncio.sleep(0.1)
         with open(key_dir / protocol.segment_name(1), "wb") as f:
             f.write(protocol.encode_event_line(1, _ev("2026-06-10T14:00:00Z", marker=1)))
             f.write(b'{"seq": 2, "ev": {"TimeSta\n')  # a torn line that WAS event 2
             f.write(protocol.encode_event_line(3, _ev("2026-06-10T14:00:00Z", marker=3)))
-        write_manifest_raw(key_dir, seq_highwater=3, join={"segment": 1, "offset": 0, "seq": 1})
-        client = make_client(feed_dir)
-        gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 1)
+        got = await task
         assert got[0]["_marker"] == 1
         with pytest.raises(FeedGapError):
             await gen.__anext__()
@@ -342,13 +397,15 @@ class TestGapHardError:
 class TestHeartbeatLiveness:
     async def test_stale_heartbeat_while_idle_raises_dead_and_keeps_cursor(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path)
-        seq, seg, off = writer.append(_ev("2026-06-10T14:00:00Z", marker=1))
-        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
-        touch_heartbeat(feed_dir, age_secs=100.0)
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         client = make_client(feed_dir, idle_check_secs=0.15, heartbeat_stale_secs=0.3)
         gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 1)
+        task = asyncio.create_task(collect(gen, 1))
+        await asyncio.sleep(0.05)
+        writer.append(_ev("2026-06-10T14:00:00Z", marker=1))
+        got = await task
         assert got[0]["_marker"] == 1
+        touch_heartbeat(feed_dir, age_secs=100.0)  # handler dies; stream goes idle
         with pytest.raises(FeedHandlerDeadError):
             await asyncio.wait_for(gen.__anext__(), timeout=5.0)
         # Cursor KEPT: recovery after a handler restart is a resume-replay.
@@ -357,19 +414,20 @@ class TestHeartbeatLiveness:
 
     async def test_fresh_bytes_reset_the_idle_clock(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path)
-        seq, seg, off = writer.append(_ev("2026-06-10T14:00:00Z", marker=0))
-        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         touch_heartbeat(feed_dir, age_secs=100.0)  # handler "dead" the whole time
         client = make_client(feed_dir, idle_check_secs=0.5, heartbeat_stale_secs=0.3)
         gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 9, timeout=5.0))
+        await asyncio.sleep(0.05)  # consumer attaches at the tail
 
         async def pump():
-            for i in range(1, 9):
+            for i in range(9):
                 writer.append(_ev("2026-06-10T14:00:00Z", marker=i))
                 await asyncio.sleep(0.1)
 
         pump_task = asyncio.create_task(pump())
-        got = await collect(gen, 9, timeout=5.0)  # flows for ~0.8s with no raise
+        got = await task  # flows for ~0.9s with no raise
         await pump_task
         assert [ev["_marker"] for ev in got] == list(range(9))
         with pytest.raises(FeedHandlerDeadError):  # then idle -> dead detected
@@ -390,13 +448,15 @@ class TestHeartbeatLiveness:
 class TestSegmentRolls:
     async def test_roll_followed_mid_tail(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path, segment_max_bytes=1)
-        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 5)]
-        positions = [writer.append(ev) for ev in events]
-        seq, seg, off = positions[0]
-        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         client = make_client(feed_dir)
         gen = client.stream_bars("ESM26", "15", "Minute")
-        got = await collect(gen, 4)
+        task = asyncio.create_task(collect(gen, 4))
+        await asyncio.sleep(0.1)  # consumer attaches at the tail
+        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 5)]
+        for ev in events:
+            writer.append(ev)
+        got = await task
         # Live roll while tailing:
         late = _ev("2026-06-10T14:15:00Z", marker=5)
         writer.append(late)
@@ -407,17 +467,40 @@ class TestSegmentRolls:
 
     async def test_roll_during_resume_replay(self, tmp_path):
         feed_dir, key_dir, writer = make_feed(tmp_path, segment_max_bytes=1)
-        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 5)]
-        positions = [writer.append(ev) for ev in events]
-        seq, seg, off = positions[0]
-        writer.write_manifest(seed_event=None, join=(seg, off, seq), last_close_ts="")
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
         client = make_client(feed_dir)
         gen1 = client.stream_bars("ESM26", "15", "Minute")
-        assert await collect(gen1, 1) == events[:1]
+        task = asyncio.create_task(collect(gen1, 1))
+        await asyncio.sleep(0.1)
+        events = [_ev("2026-06-10T14:00:00Z", marker=i) for i in range(1, 5)]
+        for ev in events:
+            writer.append(ev)
+        assert await task == events[:1]
         await gen1.aclose()
         gen2 = client.stream_bars("ESM26", "15", "Minute")  # resume crosses 3 rolls
         assert await collect(gen2, 3) == events[1:]
         await gen2.aclose()
+        writer.close()
+
+
+class TestRequestLease:
+    async def test_request_lease_is_refreshed_while_streaming(self, tmp_path):
+        # The request file doubles as a liveness lease: a healthy long-running
+        # stream must keep re-stamping it or the handler's key retirement
+        # would unsubscribe an ACTIVE key.
+        feed_dir, key_dir, writer = make_feed(tmp_path)
+        writer.write_manifest(seed_event=None, join=None, last_close_ts="")
+        client = make_client(feed_dir, request_refresh_secs=0.05)
+        gen = client.stream_bars("ESM26", "15", "Minute")
+        task = asyncio.create_task(collect(gen, 1, timeout=2.0))
+        req = feed_dir / protocol.REQUESTS_DIR / f"{KEY}{protocol.REQUEST_SUFFIX}"
+        await asyncio.sleep(0.1)
+        first = os.stat(req).st_mtime
+        await asyncio.sleep(0.2)
+        assert os.stat(req).st_mtime > first  # re-stamped while idle-streaming
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await gen.aclose()
         writer.close()
 
 

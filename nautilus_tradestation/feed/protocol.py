@@ -8,11 +8,20 @@ no sockets, no server.
 
 Layout (all under ``%LOCALAPPDATA%/example/feed/<account>/`` — LOCAL disk only):
 
-    handler.heartbeat              touched (os.utime) every ~2s by the handler
+    handler.heartbeat              touched (os.utime) every ~2s by the handler;
+                                   FROZEN while any mirror append/manifest IO fails
+                                   (silence must read as handler-dead, not quiet market)
+    handler.lock                   exclusive single-writer lock, held open for the
+                                   handler's lifetime (OS releases it on death)
     handler.meta.json              {"v":1,"pid":...,"account":...,"started_utc":...}
     handler.stop                   planned-stop marker (operator/supervisor)
-    requests/<key>.req.json        subscription drop-dir (cells write, handler scans)
-    bars/<key>/manifest.json       seed/join/seq highwater, atomic (tmp + os.replace)
+    logs/handler.log               handler's own rotating log (10MB x 3)
+    requests/<key>.req.json        subscription drop-dir (cells write, handler scans);
+                                   doubles as a lease — cells re-stamp it every
+                                   REQUEST_REFRESH_SECS; the handler retires keys
+                                   with no fresh lease within REQUEST_TTL_SECS
+    bars/<key>/manifest.json       seed/seq highwater (+ join, audit metadata only:
+                                   fresh subscribers never replay it), atomic
     bars/<key>/00000001.jsonl ...  segments, monotonic 8-digit numbering, size-rotated
 
 Segment line format (one JSON object per ``\\n``-terminated UTF-8 line):
@@ -44,11 +53,18 @@ SEGMENT_MAX_BYTES = 10_000_000
 SEGMENT_SUFFIX = ".jsonl"
 MANIFEST_NAME = "manifest.json"
 HEARTBEAT_NAME = "handler.heartbeat"
+LOCK_NAME = "handler.lock"
 META_NAME = "handler.meta.json"
 STOP_MARKER_NAME = "handler.stop"
 REQUESTS_DIR = "requests"
 BARS_DIR = "bars"
 REQUEST_SUFFIX = ".req.json"
+
+# Request-file lease: cells re-stamp their request this often while streaming;
+# the handler retires a key (drops its TS SSE subscription) once its ingest is
+# older than the TTL and no lease has been re-stamped within it.
+REQUEST_REFRESH_SECS = 300.0
+REQUEST_TTL_SECS = 3600.0
 
 # decode_line result kinds
 EVENT = "event"
