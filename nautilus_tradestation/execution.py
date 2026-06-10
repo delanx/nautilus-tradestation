@@ -1176,8 +1176,30 @@ class TradeStationExecutionClient(LiveExecutionClient):
             from nautilus_trader.model.instruments import Equity
 
             if isinstance(instrument, Equity):
-                # For equities, TS requires SellShort/BuyToCover for short positions
-                # Calculate net position from open positions in cache
+                # For equities, TS requires SellShort/BuyToCover for short positions.
+                # AUTHORITY ORDER (bug: SPY EQUITY-GROUP-ORDER 'boxed position' 2026-06-10): the
+                # submitting strategy KNOWS its intent and tags the order
+                # (TS_INTENT:close_short / close_long / open). The cache inference
+                # below stays as fallback only -- the Nautilus cache showed FLAT
+                # while the account was short 100 SPY (a dropped/unparsed status
+                # report), so a flatten BUY went out as plain 'Buy' and was
+                # REJECTED, orphaning the short.
+                intent = None
+                for tag in (order.tags or []):
+                    if str(tag).startswith("TS_INTENT:"):
+                        intent = str(tag).split(":", 1)[1]
+                        break
+                if intent == "close_short" and order.side == OrderSide.BUY:
+                    params["trade_action"] = "BuyToCover"
+                    if self._extended_hours:
+                        params["time_in_force"] = "DYP"
+                    return params
+                if intent == "close_long" and order.side == OrderSide.SELL:
+                    params["trade_action"] = "Sell"
+                    if self._extended_hours:
+                        params["time_in_force"] = "DYP"
+                    return params
+                # Calculate net position from open positions in cache (fallback)
                 open_positions = self._cache.positions_open(
                     instrument_id=order.instrument_id,
                 )
