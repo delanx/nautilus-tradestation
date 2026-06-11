@@ -243,7 +243,7 @@ class TestStreamEventParsing:
 class TestStreamClientConfig:
     """Config fields propagate to the streaming layer correctly."""
 
-    def test_use_streaming_false_by_default(self):
+    def test_use_streaming_true_by_default(self):
         """The config default keeps streaming off."""
         from nautilus_tradestation.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
