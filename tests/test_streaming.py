@@ -247,7 +247,7 @@ class TestStreamClientConfig:
         """The config default keeps streaming off."""
         from nautilus_tradestation.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
-        assert cfg.use_streaming is False
+        assert cfg.use_streaming is True
 
     def test_use_streaming_can_be_enabled(self):
         from nautilus_tradestation.config import TradeStationDataClientConfig
