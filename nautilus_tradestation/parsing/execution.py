@@ -174,12 +174,53 @@ def parse_ts_order_type(ts_order_type: str) -> OrderType:
     return _MAP.get(ts_order_type, OrderType.MARKET)
 
 
+def _decimal_or_zero(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001 -- any unparseable quantity counts as absent
+        return Decimal(0)
+
+
+def resolve_order_quantities(ts_order: dict) -> tuple[Decimal, Decimal]:
+    """Resolve ``(ordered, filled)`` quantities from a raw TS order payload.
+
+    TradeStation does not always populate the top-level ``Quantity`` /
+    ``FilledQuantity`` fields: several payload shapes (notably futures order
+    statuses) carry quantities only inside ``Legs`` — the same schema quirk as
+    the Legs-only ``Symbol`` handled during reconciliation.  Before this
+    helper, a payload without a top-level ``Quantity`` flowed ``0`` into the
+    ``OrderStatusReport`` constructor, which raises ``'quantity' not a
+    positive real`` — caught broadly, so the whole status report was silently
+    DROPPED (46x in one dead node's stderr; bug ledger C1-PARSE).  A dropped
+    status report can desync engine state from broker state.
+
+    Fallback order (first non-zero wins):
+      ordered: top-level ``Quantity`` -> ``Legs[0].QuantityOrdered`` -> filled
+      filled:  top-level ``FilledQuantity`` -> ``Legs[0].ExecQuantity``
+
+    Multi-leg group orders report leg 0, consistent with every other Legs
+    fallback in this adapter (symbol, execution price).
+    """
+    ordered = _decimal_or_zero(ts_order.get("Quantity") or "0")
+    filled = _decimal_or_zero(ts_order.get("FilledQuantity") or "0")
+    legs = ts_order.get("Legs") or []
+    if ordered == 0 and legs:
+        ordered = _decimal_or_zero(legs[0].get("QuantityOrdered") or "0")
+    if filled == 0 and legs:
+        filled = _decimal_or_zero(legs[0].get("ExecQuantity") or "0")
+    if filled > ordered:
+        # A fill proves at least that much was ordered.
+        ordered = filled
+    return ordered, filled
+
+
 def parse_order_status_report(
     ts_order: dict,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     account_id: AccountId,
     ts_now: int,
+    fallback_quantity: Decimal | None = None,
 ) -> OrderStatusReport | None:
     """Parse a raw TradeStation order dict into an OrderStatusReport.
 
@@ -195,18 +236,37 @@ def parse_order_status_report(
         The NautilusTrader account ID.
     ts_now : int
         Current timestamp in nanoseconds (from clock).
+    fallback_quantity : Decimal, optional
+        Ordered quantity to use when the payload itself carries none anywhere
+        (no top-level ``Quantity``, no ``Legs`` quantity, no fill) — callers
+        with a cached engine order pass its quantity so the report survives
+        instead of being dropped (bug ledger C1-PARSE).
 
     Returns
     -------
     OrderStatusReport or None
-        Parsed report, or None if parsing fails.
+        Parsed report, or None if parsing fails or no positive ordered
+        quantity can be resolved from payload + fallback (logged loudly —
+        never a silent exception-driven drop).
     """
     try:
         ts_order_id = ts_order.get("OrderID")
         status = parse_order_status(ts_order.get("Status", ""))
 
-        qty_ordered = Decimal(ts_order.get("Quantity") or "0")
-        qty_filled = Decimal(ts_order.get("FilledQuantity") or "0")
+        qty_ordered, qty_filled = resolve_order_quantities(ts_order)
+        if qty_ordered == 0 and fallback_quantity is not None and fallback_quantity > 0:
+            qty_ordered = fallback_quantity
+        if qty_ordered == 0:
+            # Classified drop, not an exception: OrderStatusReport requires a
+            # positive quantity, and this payload offers none anywhere.
+            _log.warning(
+                "Zero-quantity order status report dropped (C1-PARSE): "
+                "OrderID=%s Status=%s has no Quantity, no Legs quantity, no fill "
+                "and no cached-order fallback",
+                ts_order_id,
+                ts_order.get("Status"),
+            )
+            return None
 
         price_str = ts_order.get("LimitPrice") or ts_order.get("Price") or "0"
         price = Price.from_str(price_str) if price_str != "0" else None

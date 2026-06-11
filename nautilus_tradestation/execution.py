@@ -1468,13 +1468,28 @@ class TradeStationExecutionClient(LiveExecutionClient):
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
     ) -> OrderStatusReport | None:
-        """Parse TradeStation order into OrderStatusReport."""
+        """Parse TradeStation order into OrderStatusReport.
+
+        When the payload carries no quantity anywhere (some TS payload shapes
+        omit top-level Quantity AND Legs quantities), the cached engine
+        order's quantity is passed as the fallback so the status report is
+        not silently dropped (bug ledger C1-PARSE — a dropped report can
+        desync engine vs broker state).
+        """
+        fallback_quantity: Decimal | None = None
+        try:
+            cached_order = self._cache.order(client_order_id)
+            if cached_order is not None:
+                fallback_quantity = Decimal(str(cached_order.quantity))
+        except Exception:  # noqa: BLE001 -- fallback only; never block the parse
+            fallback_quantity = None
         return parse_order_status_report(
             ts_order,
             instrument_id,
             client_order_id,
             account_id=self._account_id_nautilus,
             ts_now=self._clock.timestamp_ns(),
+            fallback_quantity=fallback_quantity,
         )
 
     def _parse_ts_order_type(self, ts_order_type: str) -> OrderType:

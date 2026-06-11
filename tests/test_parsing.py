@@ -187,6 +187,118 @@ class TestParsingExecutionModule:
         # Either None or a minimal report is acceptable; must not raise
         assert report is None or report is not None
 
+    # -- C1-PARSE: zero/Legs-only quantity handling ---------------------------
+    # Bug ledger C1-PARSE: payloads without a top-level Quantity flowed 0 into
+    # OrderStatusReport, which raises "'quantity' not a positive real"; the
+    # broad except silently dropped the report (46x in one dead node's stderr).
+
+    def test_parse_order_status_report_legs_only_quantity(self):
+        """Futures-shaped payload: quantity lives ONLY in Legs (like Symbol)."""
+        payload = {
+            "OrderID": "TS-ORDER-LEGS",
+            "Status": "CAN",
+            "Legs": [{
+                "Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Buy",
+                "QuantityOrdered": "2", "ExecQuantity": "0", "ExecutionPrice": "0",
+            }],
+            "OrderType": "Limit",
+            "LimitPrice": "6000.0",
+            "TradeAction": "Buy",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-LEGS"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None  # was dropped before the C1-PARSE fix
+        assert report.order_status == OrderStatus.CANCELED
+        assert float(report.quantity) == 2.0
+        assert float(report.filled_qty) == 0.0
+
+    def test_parse_order_status_report_legs_only_partial_fill(self):
+        """Legs-only quantities including a partial fill (ExecQuantity)."""
+        payload = {
+            "OrderID": "TS-ORDER-FLP",
+            "Status": "FLP",
+            "Legs": [{
+                "Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Buy",
+                "QuantityOrdered": "3", "ExecQuantity": "1", "ExecutionPrice": "6000.0",
+            }],
+            "OrderType": "Market",
+            "TradeAction": "Buy",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-FLP"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None
+        assert report.order_status == OrderStatus.PARTIALLY_FILLED
+        assert float(report.quantity) == 3.0
+        assert float(report.filled_qty) == 1.0
+
+    def test_parse_order_status_report_zero_qty_uses_cached_fallback(self):
+        """No quantity anywhere in the payload -> cached order qty keeps the report."""
+        from decimal import Decimal
+        payload = {
+            "OrderID": "TS-ORDER-ZQ",
+            "Status": "OUT",
+            "OrderType": "Market",
+            "TradeAction": "Sell",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-ZQ"),
+            _ACCOUNT_ID, _TS_NOW,
+            fallback_quantity=Decimal("4"),
+        )
+        assert report is not None
+        assert report.order_status == OrderStatus.CANCELED
+        assert report.order_side == OrderSide.SELL
+        assert float(report.quantity) == 4.0
+
+    def test_parse_order_status_report_zero_qty_no_fallback_classified_drop(self):
+        """Genuinely quantity-less payload with no fallback: drops with a
+        classified warning (return None), never an exception-driven drop."""
+        import logging
+        payload = {
+            "OrderID": "TS-ORDER-ZQ2",
+            "Status": "OUT",
+            "OrderType": "Market",
+            "TradeAction": "Buy",
+        }
+        logger = logging.getLogger("nautilus_tradestation.parsing.execution")
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            report = parse_order_status_report(
+                payload,
+                InstrumentId.from_str("ESM26.TRADESTATION"),
+                ClientOrderId("O-ZQ2"),
+                _ACCOUNT_ID, _TS_NOW,
+            )
+        finally:
+            logger.removeHandler(handler)
+        assert report is None
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert warnings, "expected a classified C1-PARSE warning"
+        assert "C1-PARSE" in warnings[0].getMessage()
+        # and NO 'Failed to parse' error (the old exception-driven path)
+        assert not any(r.levelno >= logging.ERROR for r in records)
+
+    def test_resolve_order_quantities_fill_proves_ordered(self):
+        """ordered < filled can't happen: a fill proves at least that much ordered."""
+        from nautilus_tradestation.parsing.execution import resolve_order_quantities
+        ordered, filled = resolve_order_quantities(
+            {"FilledQuantity": "2"},  # no Quantity, no Legs
+        )
+        assert ordered == 2 and filled == 2
+
     # -- convert_order_type --------------------------------------------------
 
     def test_convert_order_type_market(self):
