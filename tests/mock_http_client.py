@@ -81,6 +81,13 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
             json.loads((_RESOURCES / "order_canceled.json").read_text()),
         ]
 
+    async def get_orders_by_ids(
+        self, account_keys: str, order_ids: str,
+    ) -> list[dict[str, Any]]:
+        wanted = set(order_ids.split(","))
+        orders = await self.get_orders(account_keys)
+        return [o for o in orders if o.get("OrderID") in wanted]
+
     async def place_order_group(
         self, group_type: str, orders: list[dict[str, Any]],
     ) -> dict[str, Any]:

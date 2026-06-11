@@ -251,3 +251,27 @@ async def test_place_order_group_raises_on_error(http_client):
     http_client._httpx.post = AsyncMock(return_value=_mock_resp(400, None))
     with pytest.raises(Exception, match="Place order group failed"):
         await http_client.place_order_group("OCO", [])
+
+
+@pytest.mark.asyncio
+async def test_get_orders_by_ids_uses_correct_url(http_client):
+    """get_orders_by_ids targets /brokerage/accounts/{keys}/orders/{ids}."""
+    captured = {}
+
+    async def mock_get(url, headers=None, **kw):
+        captured["url"] = url
+        return _mock_resp(200, {"Orders": [{"OrderID": "TS-010"}]})
+
+    http_client._httpx.get = mock_get
+    result = await http_client.get_orders_by_ids("SIM0000001F", "TS-010,TS-011")
+
+    assert captured["url"].endswith("/brokerage/accounts/SIM0000001F/orders/TS-010,TS-011")
+    assert result == [{"OrderID": "TS-010"}]
+
+
+@pytest.mark.asyncio
+async def test_get_orders_by_ids_raises_on_error(http_client):
+    """get_orders_by_ids raises on non-200 status."""
+    http_client._httpx.get = AsyncMock(return_value=_mock_resp(404, None))
+    with pytest.raises(Exception, match="Get orders by IDs failed"):
+        await http_client.get_orders_by_ids("SIM0000001F", "TS-010")

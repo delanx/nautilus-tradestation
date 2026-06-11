@@ -2,6 +2,7 @@
 Parsing functions for TradeStation execution reports and order conversion.
 """
 import logging
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -52,6 +53,59 @@ def convert_time_in_force(tif: TimeInForce) -> str:
         TimeInForce.FOK: "FOK",
     }
     return _MAP.get(tif, "DAY")
+
+
+def intent_from_tags(order: Order) -> str | None:
+    """Return the TS_INTENT tag value from an order's tags, if present.
+
+    Submitting strategies tag orders with their intent (e.g.
+    ``TS_INTENT:close_short``) so the adapter can choose the correct
+    TradeStation TradeAction without inferring from cached position state
+    (the SPY EQUITY-GROUP-ORDER 'boxed position' lesson — the cache can be wrong).
+
+    Parameters
+    ----------
+    order : Order
+        The order whose tags to inspect.
+
+    Returns
+    -------
+    str | None
+        The intent value (e.g. ``"close_short"``), or ``None`` when no
+        ``TS_INTENT:`` tag is present.
+    """
+    for tag in order.tags or []:
+        tag_str = str(tag)
+        if tag_str.startswith("TS_INTENT:"):
+            return tag_str.split(":", 1)[1]
+    return None
+
+
+def equity_trade_action_from_intent(order: Order) -> str | None:
+    """Map an EQUITY order's TS_INTENT tag to a TradeStation TradeAction.
+
+    TradeStation requires ``BuyToCover`` to close an equity short and plain
+    ``Sell`` to close an equity long. Futures must NOT use this mapping —
+    TradeStation rejects SellShort/BuyToCover on futures.
+
+    Parameters
+    ----------
+    order : Order
+        The equity order whose intent tag to map.
+
+    Returns
+    -------
+    str | None
+        ``"BuyToCover"`` for a tagged short-cover BUY, ``"Sell"`` for a
+        tagged long-close SELL, or ``None`` when no intent tag applies
+        (caller keeps its default Buy/Sell action).
+    """
+    intent = intent_from_tags(order)
+    if intent == "close_short" and order.side == OrderSide.BUY:
+        return "BuyToCover"
+    if intent == "close_long" and order.side == OrderSide.SELL:
+        return "Sell"
+    return None
 
 
 def convert_order_to_ts_format(order: Order, account_id: str) -> dict[str, Any]:
@@ -301,6 +355,7 @@ def _group_type_for_order_list(orders: list[Order]) -> str | None:
 def convert_order_list_to_ts_group(
     orders: list[Order],
     account_id: str,
+    is_equity: Callable[[Order], bool] | None = None,
 ) -> tuple[str, list[dict]] | None:
     """Convert an NT OrderList into a TradeStation group order payload.
 
@@ -310,6 +365,12 @@ def convert_order_list_to_ts_group(
         The orders from the OrderList (must be 2+ orders with contingencies).
     account_id : str
         The TradeStation account ID.
+    is_equity : Callable[[Order], bool], optional
+        Predicate returning ``True`` when an order's instrument is an equity.
+        When provided, equity legs honor ``TS_INTENT`` tags so short-cover
+        legs go out as ``BuyToCover`` instead of plain ``Buy`` (the SPY EQUITY-GROUP-ORDER
+        rejection class — design §13-1). When ``None`` (default) payloads are
+        byte-identical to the previous behavior.
 
     Returns
     -------
@@ -334,6 +395,13 @@ def convert_order_list_to_ts_group(
             "TradeAction": params["trade_action"],
             "TimeInForce": {"Duration": params["time_in_force"]},
         }
+        # Equity legs honor TS_INTENT tags (EQUITY-GROUP-ORDER class, design §13-1):
+        # without this an equity short-cover leg goes out plain 'Buy' and
+        # is rejected by TradeStation. Futures keep plain Buy/Sell.
+        if is_equity is not None and is_equity(order):
+            intent_action = equity_trade_action_from_intent(order)
+            if intent_action is not None:
+                payload["TradeAction"] = intent_action
         if "limit_price" in params:
             payload["LimitPrice"] = params["limit_price"]
         if "stop_price" in params:

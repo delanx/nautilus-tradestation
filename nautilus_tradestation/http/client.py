@@ -475,6 +475,38 @@ class TradeStationHttpClient:
         data = response.json()
         return data.get("Orders", []) if isinstance(data, dict) else data
 
+    async def get_orders_by_ids(
+        self,
+        account_keys: str,
+        order_ids: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get specific orders by ID for account(s).
+
+        Used for one-shot order status polls — e.g. resolving the
+        cancel/fill race on a resting bracket leg ("Not an open order"
+        with no fill event yet) without fetching the whole order list.
+
+        Parameters
+        ----------
+        account_keys : str
+            Account key(s) — single or comma-separated.
+        order_ids : str
+            Order ID(s) — single or comma-separated.
+
+        Return
+        -------
+        list[dict[str, Any]]
+            List of order dictionaries (empty if none found).
+
+        """
+        url = f"{self.base_url}/brokerage/accounts/{account_keys}/orders/{order_ids}"
+        response = await self._httpx.get(url, headers=await self._get_headers())
+        if response.status_code != 200:
+            raise Exception(f"Get orders by IDs failed: {response.text}")
+        data = response.json()
+        return data.get("Orders", []) if isinstance(data, dict) else data
+
     async def place_order_group(
         self,
         group_type: str,

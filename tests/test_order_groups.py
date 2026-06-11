@@ -12,6 +12,8 @@ import pytest
 from nautilus_tradestation.parsing.execution import (
     _group_type_for_order_list,
     convert_order_list_to_ts_group,
+    equity_trade_action_from_intent,
+    intent_from_tags,
 )
 from nautilus_trader.model.enums import (
     ContingencyType,
@@ -42,7 +44,8 @@ def _uid():
 def _limit_order(coid: str, side: OrderSide, price: float,
                  contingency: ContingencyType = ContingencyType.OCO,
                  order_list_id: str = "OL-001",
-                 linked: list[str] | None = None):
+                 linked: list[str] | None = None,
+                 tags: list[str] | None = None):
     from nautilus_trader.model.orders import LimitOrder
     return LimitOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
@@ -56,6 +59,7 @@ def _limit_order(coid: str, side: OrderSide, price: float,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
@@ -81,7 +85,8 @@ def _market_order(coid: str, side: OrderSide,
 def _stop_order(coid: str, side: OrderSide, stop_price: float,
                 contingency: ContingencyType = ContingencyType.OCO,
                 order_list_id: str = "OL-001",
-                linked: list[str] | None = None):
+                linked: list[str] | None = None,
+                tags: list[str] | None = None):
     from nautilus_trader.model.orders import StopMarketOrder
     return StopMarketOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
@@ -96,6 +101,7 @@ def _stop_order(coid: str, side: OrderSide, stop_price: float,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
@@ -232,3 +238,110 @@ class TestPlaceOrderGroupFixture:
         )
         assert result["OrderGroupId"] == "GRP-001"
         assert len(result["Orders"]) == 2
+
+
+
+class TestIntentHelpers:
+    """Tests for intent_from_tags / equity_trade_action_from_intent."""
+
+    def test_intent_extracted_from_tags(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short", "TS_BRACKET:pod:O-E"])
+        assert intent_from_tags(o) == "close_short"
+
+    def test_no_tags_returns_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"])
+        assert intent_from_tags(o) is None
+
+    def test_unrelated_tags_return_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["SOMETHING_ELSE"])
+        assert intent_from_tags(o) is None
+
+    def test_close_short_buy_maps_to_buy_to_cover(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short"])
+        assert equity_trade_action_from_intent(o) == "BuyToCover"
+
+    def test_close_long_sell_maps_to_sell(self):
+        o = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_long"])
+        assert equity_trade_action_from_intent(o) == "Sell"
+
+    def test_mismatched_intent_and_side_returns_none(self):
+        # close_short on a SELL order makes no sense — no mapping applied
+        o = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short"])
+        assert equity_trade_action_from_intent(o) is None
+
+    def test_open_intent_returns_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:open"])
+        assert equity_trade_action_from_intent(o) is None
+
+
+
+class TestEquityIntentInGroupPayloads:
+    """Design §13-1 — equity group legs honor TS_INTENT tags (EQUITY-GROUP-ORDER class).
+
+    An equity short-cover leg must go out as BuyToCover; the plain converter
+    would send 'Buy' and TradeStation would reject it (the SPY EQUITY-GROUP-ORDER bug).
+    Futures legs must keep plain Buy/Sell regardless of tags.
+    """
+
+    def _short_cover_oco_pair(self):
+        # Closing an equity SHORT: SL stop ABOVE entry + TP limit BELOW,
+        # both BUY legs tagged with the strategy's intent.
+        sl = _stop_order("O-SL", OrderSide.BUY, 460.0, ContingencyType.OCO,
+                         linked=["O-TP"], tags=["TS_INTENT:close_short"])
+        tp = _limit_order("O-TP", OrderSide.BUY, 430.0, ContingencyType.OCO,
+                          linked=["O-SL"], tags=["TS_INTENT:close_short"])
+        return [sl, tp]
+
+    def test_equity_short_cover_legs_use_buy_to_cover(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["BuyToCover", "BuyToCover"]
+
+    def test_futures_legs_keep_plain_buy_despite_intent_tags(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: False,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_no_predicate_keeps_previous_behavior(self):
+        # Default (no is_equity) must be byte-identical to today's payloads.
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_equity_long_close_legs_stay_sell(self):
+        sl = _stop_order("O-SL", OrderSide.SELL, 430.0, ContingencyType.OCO,
+                         linked=["O-TP"], tags=["TS_INTENT:close_long"])
+        tp = _limit_order("O-TP", OrderSide.SELL, 460.0, ContingencyType.OCO,
+                          linked=["O-SL"], tags=["TS_INTENT:close_long"])
+        _, payloads = convert_order_list_to_ts_group(
+            [sl, tp], _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Sell", "Sell"]
+
+    def test_untagged_equity_legs_keep_plain_action(self):
+        sl = _stop_order("O-SL", OrderSide.BUY, 460.0, ContingencyType.OCO,
+                         linked=["O-TP"])
+        tp = _limit_order("O-TP", OrderSide.BUY, 430.0, ContingencyType.OCO,
+                          linked=["O-SL"])
+        _, payloads = convert_order_list_to_ts_group(
+            [sl, tp], _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_prices_unaffected_by_intent_mapping(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        stop_payload = next(p for p in payloads if p["OrderType"] == "StopMarket")
+        limit_payload = next(p for p in payloads if p["OrderType"] == "Limit")
+        assert float(stop_payload["StopPrice"]) == pytest.approx(460.0, rel=1e-4)
+        assert float(limit_payload["LimitPrice"]) == pytest.approx(430.0, rel=1e-4)

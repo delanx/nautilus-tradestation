@@ -13,6 +13,7 @@ from nautilus_tradestation.parsing.execution import convert_order_to_ts_format
 from nautilus_tradestation.parsing.execution import convert_order_type
 from nautilus_tradestation.parsing.execution import convert_time_in_force
 from nautilus_tradestation.parsing.execution import convert_order_list_to_ts_group
+from nautilus_tradestation.parsing.execution import equity_trade_action_from_intent
 from nautilus_tradestation.parsing.execution import parse_fill_report
 from nautilus_tradestation.parsing.execution import parse_order_status
 from nautilus_tradestation.parsing.execution import parse_order_status_report
@@ -526,8 +527,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """
         orders = command.order_list.orders
 
-        # Try group submission first
-        group_result = convert_order_list_to_ts_group(orders, self._account_id)
+        # Try group submission first. The equity predicate lets group legs
+        # honor TS_INTENT tags (EQUITY-GROUP-ORDER class — design §13-1): an equity
+        # short-cover leg must go out as BuyToCover, never plain Buy.
+        group_result = convert_order_list_to_ts_group(
+            orders,
+            self._account_id,
+            is_equity=self._is_equity_order,
+        )
         if group_result is not None:
             group_type, order_payloads = group_result
             await self._submit_order_group(
@@ -575,16 +582,36 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # TS returns: {"OrderGroupId": "...", "Orders": [{"OrderID": "...", ...}, ...]}
             ts_orders = response.get("Orders", [])
             if len(ts_orders) != len(orders):
-                self._log.warning(
+                self._log.error(
                     f"Group response has {len(ts_orders)} orders but submitted {len(orders)} — "
-                    "ID mapping may be incomplete"
+                    "unmapped legs will be rejected"
                 )
 
-            for i, (order, ts_order_resp) in enumerate(zip(orders, ts_orders)):
+            for i, order in enumerate(orders):
+                ts_order_resp = ts_orders[i] if i < len(ts_orders) else {}
                 ts_order_id = ts_order_resp.get("OrderID")
                 if not ts_order_id:
-                    self._log.warning(
-                        f"No OrderID in group response leg {i}: {ts_order_resp}"
+                    # REJECTION-PATH ALERT (design §13-4): an unmapped leg is
+                    # an INVISIBLE resting order — its fill/cancel events would
+                    # be silently dropped by the session ID-map gate. Fail loud
+                    # so the strategy's rejection handling (retry-once →
+                    # degraded engine fallback) takes over instead of trusting
+                    # a protective order we cannot see.
+                    reason = (
+                        f"Group leg {i} has no OrderID in response "
+                        f"(leg response: {ts_order_resp}) — "
+                        "leg unmapped, treating as rejected"
+                    )
+                    self._log.error(
+                        f"Order group leg {i} UNMAPPED for "
+                        f"{order.client_order_id}: {reason}"
+                    )
+                    self.generate_order_rejected(
+                        strategy_id=command.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        reason=reason,
+                        ts_event=self._clock.timestamp_ns(),
                     )
                     continue
 
@@ -635,7 +662,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             return
 
-        order = self.cache.order(client_order_id)
+        # NOTE: was `self.cache` — an AttributeError on every call (this client
+        # only has `_cache`). Caught by the brackets part-1 test suite;
+        # _modify_order had never been exercised before.
+        order = self._cache.order(client_order_id)
         if order is None:
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
@@ -645,6 +675,18 @@ class TradeStationExecutionClient(LiveExecutionClient):
             ts_order_type = self._convert_order_type(order)
             ts_tif = self._convert_time_in_force(order.time_in_force)
             ts_side = "Buy" if order.side == OrderSide.BUY else "Sell"
+            # Equity covers must keep their TradeAction on replace (EQUITY-GROUP-ORDER
+            # class): replacing a BuyToCover leg with plain 'Buy' would be
+            # rejected by TradeStation. Futures keep plain Buy/Sell.
+            if self._is_equity_order(order):
+                intent_action = equity_trade_action_from_intent(order)
+                if intent_action is not None:
+                    ts_side = intent_action
+
+            # Resolve new quantity from the command (None = unchanged)
+            new_qty = (
+                command.quantity if command.quantity is not None else order.quantity
+            )
 
             # Resolve new prices from the command (None = unchanged)
             if command.trigger_price is not None:
@@ -665,7 +707,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 order_id=ts_order_id,
                 account_id=self._account_id,
                 symbol=symbol,
-                quantity=str(order.quantity),
+                quantity=str(new_qty),
                 order_type=ts_order_type,
                 trade_action=ts_side,
                 time_in_force=ts_tif,
@@ -691,7 +733,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 instrument_id=command.instrument_id,
                 client_order_id=client_order_id,
                 venue_order_id=venue_order_id,
-                quantity=order.quantity,
+                quantity=new_qty,
                 price=command.price,
                 trigger_price=command.trigger_price,
                 ts_event=self._clock.timestamp_ns(),
@@ -1162,6 +1204,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Failed to update account state: {e}")
 
+    def _is_equity_order(self, order: Order) -> bool:
+        """Return True when the order's cached instrument is an Equity."""
+        from nautilus_trader.model.instruments import Equity
+
+        return isinstance(self._cache.instrument(order.instrument_id), Equity)
+
     def _convert_order_to_ts_format(self, order: Order) -> dict[str, Any]:
         """Convert Nautilus order to TradeStation format.
 
@@ -1184,18 +1232,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # while the account was short 100 SPY (a dropped/unparsed status
                 # report), so a flatten BUY went out as plain 'Buy' and was
                 # REJECTED, orphaning the short.
-                intent = None
-                for tag in (order.tags or []):
-                    if str(tag).startswith("TS_INTENT:"):
-                        intent = str(tag).split(":", 1)[1]
-                        break
-                if intent == "close_short" and order.side == OrderSide.BUY:
-                    params["trade_action"] = "BuyToCover"
-                    if self._extended_hours:
-                        params["time_in_force"] = "DYP"
-                    return params
-                if intent == "close_long" and order.side == OrderSide.SELL:
-                    params["trade_action"] = "Sell"
+                intent_action = equity_trade_action_from_intent(order)
+                if intent_action is not None:
+                    params["trade_action"] = intent_action
                     if self._extended_hours:
                         params["time_in_force"] = "DYP"
                     return params
