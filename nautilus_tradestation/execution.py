@@ -3,6 +3,7 @@ TradeStation execution client implementation.
 """
 
 import asyncio
+import os
 from decimal import Decimal
 from typing import Any
 
@@ -71,6 +72,61 @@ from nautilus_trader.model.orders import StopLimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
 
 
+def _venue_confirmed_cancels_enabled() -> bool:
+    """TS_VENUE_CONFIRMED_CANCELS=1: a REST DELETE 200 is treated as a
+    cancel REQUEST acknowledgment, not venue-terminal state.
+
+    TradeStation's DELETE acknowledges the request; the order can still FILL
+    inside the race window (exactly the fast tape a resting stop leg gets
+    canceled in).  Synthesizing ``OrderCanceled`` on the 200 makes the order
+    terminal in Nautilus, so the real SSE ``FLL`` that follows is dropped by
+    the ``is_closed`` gate -- leg fill + a released market exit double-fill the
+    position (DESIGN.md §7 / checklist V-3).  With the flag set
+    the cancel only becomes terminal on the venue's own CAN event (SSE stream,
+    status poll, or a one-shot order-status query).  Unset (the default) keeps
+    today's synthetic-cancel behavior byte-identical.
+    """
+    return os.environ.get("TS_VENUE_CONFIRMED_CANCELS", "") in ("1", "true", "True")
+
+
+def _stream_fill_hardening_enabled() -> bool:
+    """TS_STREAM_FILL_HARDENING=1: never permanently lose a fill event.
+
+    Two defects in the streaming/poll event processing (unset keeps both,
+    byte-identical):
+
+    1. ``_order_last_status`` was recorded BEFORE the zero-price ``FLL`` skip,
+       so the dedup gate dropped any repeat of the same fill -- and the log
+       line's promised "order status report will reconcile" does not exist in
+       streaming mode.  Hardened: the status is recorded only AFTER the event
+       was fully processed, so a skipped fill stays retryable.
+    2. The SSE fill path lacked the poll path's 4th price fallback (the
+       order's own trigger/limit price).  Hardened: mirrored.
+    """
+    return os.environ.get("TS_STREAM_FILL_HARDENING", "") in ("1", "true", "True")
+
+
+def _stream_reconcile_poll_secs() -> float:
+    """TS_STREAM_RECONCILE_POLL_SECS=<seconds>: slow REST status-poll
+    reconciliation while SSE streaming is active.
+
+    ``use_streaming=True`` historically ran NO status polling at all, so a
+    fill the SSE path lost (zero-price skip, or the mapping race where the SSE
+    ``FLL`` arrives before the REST submit response registers
+    ``ts_order_id -> client_order_id``) had no backstop.  A value > 0 runs
+    ``_check_order_statuses`` every that-many seconds; the shared
+    ``_order_last_status`` dedup keeps SSE + poll from double-emitting.
+    Unset/0 (the default) keeps today's streaming-only behavior byte-identical.
+    """
+    raw = os.environ.get("TS_STREAM_RECONCILE_POLL_SECS", "")
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
 class TradeStationExecutionClient(LiveExecutionClient):
     """
     Provide an execution client for TradeStation.
@@ -135,6 +191,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._order_last_status: dict[str, str] = {}  # ts_order_id → last seen status
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
+        # Slow REST reconcile poll behind SSE streaming (gated by
+        # TS_STREAM_RECONCILE_POLL_SECS; None when streaming is off or unset)
+        self._status_reconcile_task: asyncio.Task | None = None
 
         # Streaming configuration
         self._use_streaming = use_streaming
@@ -185,6 +244,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.info(
                 "Started order fill detection via SSE streaming", LogColor.GREEN
             )
+            reconcile_secs = _stream_reconcile_poll_secs()
+            if reconcile_secs > 0:
+                self._status_reconcile_task = self._loop.create_task(
+                    self._reconcile_order_statuses_loop(reconcile_secs)
+                )
+                self._log.info(
+                    "Started slow REST order-status reconcile poll "
+                    f"(every {reconcile_secs:.0f}s) behind the SSE stream",
+                    LogColor.GREEN,
+                )
         else:
             self._fill_poll_task = self._loop.create_task(self._poll_order_fills())
             self._log.info(
@@ -206,6 +275,15 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except asyncio.CancelledError:
                 pass
             self._fill_poll_task = None
+
+        # Stop the slow status reconcile poll (streaming backstop)
+        if self._status_reconcile_task:
+            self._status_reconcile_task.cancel()
+            try:
+                await self._status_reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._status_reconcile_task = None
 
         await self._client.close()
         self._log.info("Disconnected from TradeStation", LogColor.GREEN)
@@ -764,15 +842,30 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 order_id=ts_order_id,
             )
 
-            self.generate_order_canceled(
-                strategy_id=command.strategy_id,
-                instrument_id=command.instrument_id,
-                client_order_id=command.client_order_id,
-                venue_order_id=VenueOrderId(ts_order_id),
-                ts_event=self._clock.timestamp_ns(),
-            )
+            if _venue_confirmed_cancels_enabled():
+                # The DELETE 200 is a cancel REQUEST acknowledgment, not venue-
+                # terminal state: the order can still FILL inside the race
+                # window.  Synthesizing OrderCanceled here would close the
+                # order in Nautilus and the racing real fill would be dropped
+                # by the is_closed gate (double-fill class, design §7/V-3).
+                # The venue's own CAN (SSE / status poll / one-shot query)
+                # makes it terminal.
+                self._log.info(
+                    f"Cancel request for {command.client_order_id} "
+                    f"({ts_order_id}) acknowledged — awaiting venue cancel event"
+                )
+            else:
+                self.generate_order_canceled(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=command.client_order_id,
+                    venue_order_id=VenueOrderId(ts_order_id),
+                    ts_event=self._clock.timestamp_ns(),
+                )
 
-            self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
+                self._log.info(
+                    f"Order {command.client_order_id} cancelled", LogColor.GREEN
+                )
 
         except Exception as e:
             if "Not an open order" in str(e):
@@ -859,6 +952,27 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._log.error(f"Error in order fill polling: {e}")
                 await asyncio.sleep(5.0)
 
+    async def _reconcile_order_statuses_loop(self, interval_secs: float) -> None:
+        """Slow REST reconciliation behind SSE streaming (gated by
+        TS_STREAM_RECONCILE_POLL_SECS).
+
+        Backstop for events the SSE path can permanently lose: the zero-price
+        FLL skip, and the mapping race where the SSE fill arrives before the
+        REST submit response registers ``ts_order_id``.  Reuses
+        ``_check_order_statuses``; the shared ``_order_last_status`` map keeps
+        the poll from re-emitting events the stream already delivered.
+        """
+        self._log.info("Order status reconcile poll started")
+        while True:
+            try:
+                await asyncio.sleep(interval_secs)
+                await self._check_order_statuses()
+            except asyncio.CancelledError:
+                self._log.info("Order status reconcile poll stopped")
+                break
+            except Exception as e:
+                self._log.error(f"Error in order status reconcile poll: {e}")
+
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.
 
@@ -894,7 +1008,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if status == last_status:
                 continue  # No change
 
-            self._order_last_status[ts_order_id] = status
+            # Hardened (TS_STREAM_FILL_HARDENING): record the status only
+            # AFTER the event was successfully processed, so a failed fill
+            # emission stays retryable on the next poll instead of being
+            # dedup-poisoned forever.  Default keeps today's record-first.
+            hardened = _stream_fill_hardening_enabled()
+            if not hardened:
+                self._order_last_status[ts_order_id] = status
 
             # Look up the NautilusTrader order for metadata
             cached_order = self._cache.order(client_order_id)
@@ -902,10 +1022,15 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._log.warning(
                     f"Fill poll: order {client_order_id} not found in cache (status={status})"
                 )
+                if hardened:
+                    # A cache miss does not heal on retry; record to stop the spam.
+                    self._order_last_status[ts_order_id] = status
                 continue
 
             # Skip if NautilusTrader already considers the order closed (idempotency guard)
             if cached_order.is_closed:
+                if hardened:
+                    self._order_last_status[ts_order_id] = status
                 continue
 
             venue_order_id = VenueOrderId(ts_order_id)
@@ -969,7 +1094,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         f"Order filled: {client_order_id} @ {fill_px} qty={filled_qty}",
                         LogColor.GREEN,
                     )
+                    if hardened:
+                        self._order_last_status[ts_order_id] = status
                 except Exception as e:
+                    # Hardened: status deliberately NOT recorded — the next
+                    # poll retries this fill instead of dropping it forever.
                     self._log.error(
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
@@ -984,6 +1113,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=ts_now,
                 )
                 self._log.info(f"Order canceled: {client_order_id} (status={status})")
+                if hardened:
+                    self._order_last_status[ts_order_id] = status
 
             elif status in ("REJ", "BRO", "LAT"):
                 # Rejected
@@ -996,6 +1127,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=ts_now,
                 )
                 self._log.error(f"Order rejected: {client_order_id} ({reason})")
+                if hardened:
+                    self._order_last_status[ts_order_id] = status
+
+            else:
+                # Non-terminal status (ACK/OPN/...): nothing to emit.
+                if hardened:
+                    self._order_last_status[ts_order_id] = status
 
     async def _stream_order_fills(self) -> None:
         """SSE streaming task: receive real-time order events and emit NT order events.
@@ -1067,10 +1205,19 @@ class TradeStationExecutionClient(LiveExecutionClient):
         if status == last_status:
             return  # No change
 
-        self._order_last_status[ts_order_id] = status
+        # Hardened (TS_STREAM_FILL_HARDENING): record the status only AFTER
+        # the event was successfully processed.  Recording it up front poisoned
+        # the dedup gate before the zero-price FLL skip, so the fill was dropped
+        # FOREVER in streaming mode (no status-poll backstop existed either).
+        # Default keeps today's record-first behavior byte-identical.
+        hardened = _stream_fill_hardening_enabled()
+        if not hardened:
+            self._order_last_status[ts_order_id] = status
 
         cached_order = self._cache.order(client_order_id)
         if cached_order is None or cached_order.is_closed:
+            if hardened:
+                self._order_last_status[ts_order_id] = status
             return
 
         venue_order_id = VenueOrderId(ts_order_id)
@@ -1080,10 +1227,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
             avg_px_str = ts_order.get("AveragePrice", "0")
             filled_qty_str = ts_order.get("FilledQuantity", str(cached_order.quantity))
 
-            # Three-step price fallback (mirrors _check_order_statuses):
+            # Price fallback chain (mirrors _check_order_statuses):
             #   1. AveragePrice  — standard TS fill field
             #   2. FilledPrice   — present for Market orders in TS sim
             #   3. Legs[0].ExecutionPrice — always present when filled
+            #   4. (hardened) the order's own trigger/limit price
             fill_px_raw = float(avg_px_str) if avg_px_str else 0.0
             if fill_px_raw == 0.0:
                 filled_price = ts_order.get("FilledPrice", "") or ""
@@ -1094,11 +1242,33 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if filled_price:
                     fill_px_raw = float(filled_price)
 
-            if fill_px_raw == 0.0:
-                self._log.warning(
-                    f"Stream: AveragePrice=0 for filled order {client_order_id}; "
-                    "fill event skipped — order status report will reconcile"
+            if fill_px_raw == 0.0 and hardened:
+                # 4th fallback (poll-path parity): a StopMarket fills at ~its
+                # trigger, a Limit at ~its limit — better than losing the fill.
+                fallback = getattr(cached_order, "trigger_price", None) or getattr(
+                    cached_order, "price", None
                 )
+                if fallback is not None:
+                    fill_px_raw = float(fallback)
+                    self._log.warning(
+                        f"Stream: AveragePrice=0 for filled order {client_order_id}; "
+                        f"using the order's own price {fill_px_raw} (4th fallback)"
+                    )
+
+            if fill_px_raw == 0.0:
+                if hardened:
+                    # Status deliberately NOT recorded: the reconcile poll (or
+                    # a repeated stream event) retries this fill instead of the
+                    # dedup gate dropping it forever.
+                    self._log.warning(
+                        f"Stream: AveragePrice=0 for filled order {client_order_id}; "
+                        "fill deferred to the status reconcile poll"
+                    )
+                else:
+                    self._log.warning(
+                        f"Stream: AveragePrice=0 for filled order {client_order_id}; "
+                        "fill event skipped — order status report will reconcile"
+                    )
                 return
 
             instrument = self._cache.instrument(cached_order.instrument_id)
@@ -1124,6 +1294,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_event=ts_now,
             )
             self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px}")
+            if hardened:
+                self._order_last_status[ts_order_id] = status
 
         elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
             self.generate_order_canceled(
@@ -1136,6 +1308,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.info(
                 f"Stream: order canceled: {client_order_id} (status={status})"
             )
+            if hardened:
+                self._order_last_status[ts_order_id] = status
 
         elif status in ("REJ", "BRO", "LAT"):
             reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
@@ -1147,6 +1321,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_event=ts_now,
             )
             self._log.error(f"Stream: order rejected: {client_order_id} ({reason})")
+            if hardened:
+                self._order_last_status[ts_order_id] = status
+
+        else:
+            # Non-terminal status (ACK/OPN/...): nothing to emit.
+            if hardened:
+                self._order_last_status[ts_order_id] = status
 
     # -- INTERNAL METHODS -----------------------------------------------------------------
 
