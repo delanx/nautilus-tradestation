@@ -2,6 +2,8 @@
 TradeStation instrument provider implementation.
 """
 
+import asyncio
+
 from nautilus_tradestation.constants import TRADESTATION_VENUE
 from nautilus_tradestation.http.client import TradeStationHttpClient
 from nautilus_tradestation.parsing.instruments import parse_instrument
@@ -24,6 +26,15 @@ class TradeStationInstrumentProvider(InstrumentProvider):
         Optional filters for instruments (e.g., {'asset_type': 'FUTURE'}).
 
     """
+
+    # Per-instrument HTTP timeout.  Must be > slowest observed valid load (~21 s for
+    # QMM26 in sandbox); set to 25 s so a non-responsive contract (e.g. next-month
+    # micro not yet listed in sandbox) fails after 25 s instead of the httpx default
+    # 30 s.  Without this guard a single slow instrument can consume the entire NT
+    # connection-timeout window, causing kernel.start_async() to return early before
+    # trader.start() is called — leaving the process alive but trading nothing
+    # (zombie startup).
+    _LOAD_TIMEOUT_S: float = 25.0
 
     def __init__(
         self,
@@ -81,8 +92,19 @@ class TradeStationInstrumentProvider(InstrumentProvider):
                 # Extract symbol from instrument ID
                 symbol_str = instrument_id.symbol.value
 
-                # Get symbol details from TradeStation
-                symbol_data = await self._client.get_symbol_details(symbol_str)
+                # Get symbol details from TradeStation, bounded by the
+                # per-instrument timeout so one hung API call cannot stall
+                # the whole loading pass (zombie-startup guard).
+                try:
+                    symbol_data = await asyncio.wait_for(
+                        self._client.get_symbol_details(symbol_str),
+                        timeout=self._LOAD_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    raise asyncio.TimeoutError(
+                        f"timed out after {self._LOAD_TIMEOUT_S}s — "
+                        f"TS API did not respond for {symbol_str}"
+                    )
 
                 # Parse and create instrument
                 instrument = self._parse_instrument(symbol_str, symbol_data)
