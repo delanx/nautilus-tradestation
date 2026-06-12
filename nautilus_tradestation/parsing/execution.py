@@ -12,7 +12,7 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce
+from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLimitOrder, StopMarketOrder
@@ -214,6 +214,31 @@ def resolve_order_quantities(ts_order: dict) -> tuple[Decimal, Decimal]:
     return ordered, filled
 
 
+def resolve_trigger_price(ts_order: dict) -> str | None:
+    """Resolve a stop order's trigger price from a raw TS order payload.
+
+    TradeStation carries the stop trigger as top-level ``StopPrice`` —
+    confirmed against live SIM captures of both ``/orders`` and
+    ``/historicalorders`` (2026-06-11, account SIM0000001F: every StopMarket
+    payload, open or terminal, had top-level ``StopPrice``).  Defensively we
+    also accept ``TriggerPrice`` (alternate spelling) and ``Legs[*].StopPrice``
+    (the same Legs-only schema quirk as Symbol/Quantity/ExecutionPrice).
+    Zero, empty, and unparseable values count as absent.
+    """
+    candidates: list[Any] = [ts_order.get("StopPrice"), ts_order.get("TriggerPrice")]
+    for leg in ts_order.get("Legs") or []:
+        candidates.append(leg.get("StopPrice"))
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        try:
+            if float(value) != 0.0:
+                return str(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def parse_order_status_report(
     ts_order: dict,
     instrument_id: InstrumentId,
@@ -277,16 +302,52 @@ def parse_order_status_report(
         avg_px_str = ts_order.get("AveragePrice") or "0"
         avg_px = Price.from_str(avg_px_str) if avg_px_str != "0" else None
 
+        order_type = parse_ts_order_type(ts_order.get("OrderType", "Market"))
+
+        # A stop-type report MUST carry trigger_price: during startup
+        # reconciliation the engine materializes EXTERNAL reports via
+        # OrderUnpacker -> StopMarketOrder.create_c, which does
+        # options['trigger_price'] and raises KeyError when absent — killing
+        # the WHOLE node (batch5, 10 pods, 2026-06-11T22:44:40Z).
+        trigger_price: Price | None = None
+        trigger_type = TriggerType.NO_TRIGGER
+        if order_type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT):
+            trigger_str = resolve_trigger_price(ts_order)
+            if trigger_str is None:
+                # Classified drop, not an exception, and NEVER a fabricated
+                # price: skipping this single (almost certainly EXTERNAL)
+                # report is the safest degrade — engine state for one venue
+                # order goes un-reconciled this pass; the node survives.
+                _log.error(
+                    "Stop-type order status report SKIPPED (TRIGGER-PARSE): "
+                    "OrderID=%s OrderType=%s Status=%s carries no usable "
+                    "StopPrice/TriggerPrice anywhere in the payload; emitting "
+                    "it without trigger_price would crash live reconciliation "
+                    "(KeyError 'trigger_price' in OrderUnpacker). Review this "
+                    "venue order manually.",
+                    ts_order_id,
+                    ts_order.get("OrderType"),
+                    ts_order.get("Status"),
+                )
+                return None
+            trigger_price = Price.from_str(trigger_str)
+            # OrderStatusReport requires a non-NO_TRIGGER trigger_type when
+            # trigger_price is set, and StopMarketOrder.create_c rejects
+            # NO_TRIGGER — DEFAULT means the venue's standard trigger method.
+            trigger_type = TriggerType.DEFAULT
+
         return OrderStatusReport(
             account_id=account_id,
             instrument_id=instrument_id,
             client_order_id=client_order_id,
             venue_order_id=VenueOrderId(ts_order_id) if ts_order_id else None,
             order_side=side,
-            order_type=parse_ts_order_type(ts_order.get("OrderType", "Market")),
+            order_type=order_type,
             time_in_force=TimeInForce.DAY,
             order_status=status,
             price=price,
+            trigger_price=trigger_price,
+            trigger_type=trigger_type,
             quantity=Quantity.from_str(str(qty_ordered)),
             filled_qty=Quantity.from_str(str(qty_filled)),
             avg_px=avg_px,
