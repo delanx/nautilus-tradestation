@@ -398,7 +398,9 @@ def http_client_for_groups():
         use_sandbox=True,
     )
     client._access_token = "test_access_token"
-    client.token_expiry = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    # Naive utcnow to match the client's token-expiry convention (tz-aware
+    # modernization is a separate pass — upstream a716650 deliberately skipped).
+    client.token_expiry = datetime.utcnow() + timedelta(hours=1)
     return client
 
 
