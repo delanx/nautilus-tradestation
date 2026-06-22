@@ -452,8 +452,12 @@ class TradeStationDataClient(LiveMarketDataClient):
             return
 
         if event_ts != st["buffered_ts"]:
-            # Timestamp changed → the buffered bar is now closed.
-            if st["buffered_event"]:
+            # Timestamp changed → the buffered bar is now closed.  Emit it UNLESS it
+            # was already emitted on its explicit BarStatus=="Closed" event (the
+            # low-latency fast path in the same-timestamp branch below) — avoid a
+            # duplicate emit.  The timestamp-change path remains as the fallback for
+            # any bar TradeStation does not explicitly mark Closed.
+            if st["buffered_event"] and st.get("emitted_ts") != st["buffered_ts"]:
                 bars = self._parse_bars(
                     [self._mark_bar_emit(st["buffered_event"])], bar_type, instrument
                 )
@@ -465,6 +469,23 @@ class TradeStationDataClient(LiveMarketDataClient):
         else:
             # Same timestamp — update the buffer with latest OHLCV.
             st["buffered_event"] = event
+            # LATENCY FIX (live receive transit): TradeStation marks a completed bar
+            # with BarStatus=="Closed" ~150 ms after its period ends.  Emit it NOW
+            # rather than waiting for the NEXT bar's first tick to change the
+            # timestamp — on a quiet instrument (e.g. overnight Treasuries) that next
+            # tick can be SECONDS away, which was the 1.5–10 s receive transit the
+            # whole fleet suffered.  Mark emitted_ts so the timestamp-change branch
+            # above never re-emits this same bar.
+            if event.get("BarStatus") == "Closed" and st.get("emitted_ts") != event_ts:
+                bars = self._parse_bars(
+                    [self._mark_bar_emit(event)], bar_type, instrument
+                )
+                for bar in bars:
+                    self._handle_data(bar)
+                st["emitted_ts"] = event_ts
+                self._log.debug(
+                    f"Bar emitted (Closed status) for {bar_type}: ts={event_ts}"
+                )
 
     def _mark_feed_degraded(self, bar_type: BarType, reason: str) -> None:
         """Best-effort marker that a feed is mid-resubscribe (Phase 1 alerting).
