@@ -1,5 +1,5 @@
 """
-Handler-side JSONL mirror writer for the example feed transport.
+Handler-side JSONL mirror writer for the feed transport.
 
 ``MirrorWriter`` owns one stream key's segment files and manifest. Appends are
 synchronous inline IO (local NTFS, sub-millisecond at TS bar-update rates) with

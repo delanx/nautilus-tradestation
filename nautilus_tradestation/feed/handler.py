@@ -1,10 +1,10 @@
 """
-Per-account feed handler for the example feed transport.
+Per-account feed handler for the feed transport.
 
 ``FeedHandler`` owns ALL TradeStation SSE bar subscriptions for one SIM
 account's fleet, reusing the existing ``TradeStationStreamClient`` (its
 infinite-reconnect loop is proven) for the SSE side, and appends every event
-verbatim to the per-key JSONL mirror that cells tail.
+verbatim to the per-key JSONL mirror that consumers tail.
 
 The handler synthesizes exactly ONE piece of state — ``manifest.seed_event``,
 the final update of the most recently COMPLETED bar (what TS barsback=1 would
@@ -62,7 +62,7 @@ class FeedHandler:
     account_id : str
         The SIM account this handler serves (names the feed directory).
     feed_root : Path
-        Feed root (``%LOCALAPPDATA%/example/feed``); the handler works under
+        Feed root (``%LOCALAPPDATA%/<app>/feed``); the handler works under
         ``<feed_root>/<account_id>/``. Must be on local disk.
     stream_client : TradeStationStreamClient
         The upstream SSE client (or a compatible fake in tests); only its
@@ -104,7 +104,7 @@ class FeedHandler:
         self._ingest_tasks: dict[str, asyncio.Task] = {}
         self._stop_event: asyncio.Event | None = None
         # mirror-IO failure markers ("<key>" = append, "<key>:manifest" =
-        # manifest flush): while ANY is set the heartbeat is frozen, so cells
+        # manifest flush): while ANY is set the heartbeat is frozen, so consumers
         # read total data loss as handler-dead, never as a quiet market.
         self._mirror_io_errors: set[str] = set()
         self._lock_fh = None  # exclusive single-writer lock, held for run()'s lifetime
@@ -256,7 +256,7 @@ class FeedHandler:
             except OSError:
                 continue
             if now - mtime > self._request_ttl_secs:
-                # A retired pod's leftover: live cells re-stamp their lease
+                # A retired pod's leftover: live consumers re-stamp their lease
                 # every REQUEST_REFRESH_SECS (and on every stream re-entry),
                 # so a lease this stale has no subscriber — never re-open an
                 # upstream TS SSE subscription for it.
@@ -284,7 +284,7 @@ class FeedHandler:
 
     def _verify_running_request(self, st: _IngestState, path: Path, payload: dict) -> None:
         """A request whose key is already ingesting must carry the SAME semantic
-        tuple (defense in depth behind the key hash): otherwise a cell would
+        tuple (defense in depth behind the key hash): otherwise a consumer would
         silently tail the WRONG symbol's stream. Quarantine + alert, loudly."""
         requested = (
             str(payload.get("symbol", "")),
@@ -324,7 +324,7 @@ class FeedHandler:
             _log.error(f"feed-handler: could not rename bad request {path.name}: {exc!r}")
 
     def _retire_stale_ingests(self, requests_dir: Path, now: float) -> None:
-        """Retire keys no cell leases anymore: live cells re-stamp their
+        """Retire keys no consumer leases anymore: live consumers re-stamp their
         request every REQUEST_REFRESH_SECS, so an ingest older than the TTL
         whose request is missing or stale past the TTL has zero subscribers —
         drop the upstream SSE subscription and close the writer. Mirror files
@@ -354,7 +354,7 @@ class FeedHandler:
                 pass
             _log.info(
                 f"feed-handler {self._account_id}: retired {key} "
-                f"(no cell lease within {self._request_ttl_secs:.0f}s)"
+                f"(no consumer lease within {self._request_ttl_secs:.0f}s)"
             )
 
     def _start_ingest(
@@ -412,8 +412,8 @@ class FeedHandler:
                         seq, segment, offset = st.writer.append(ev)
                     except OSError:
                         # Mirror append failing (e.g. disk full) = total data
-                        # loss for every cell on this key. Freeze the heartbeat
-                        # so cells raise FeedHandlerDeadError (never read the
+                        # loss for every consumer on this key. Freeze the heartbeat
+                        # so consumers raise FeedHandlerDeadError (never read the
                         # silence as a quiet market) and the supervisor's
                         # stale-heartbeat check restarts/escalates us.
                         self._mirror_io_errors.add(st.key)
@@ -507,7 +507,7 @@ class FeedHandler:
                 if self._mirror_io_errors:
                     # The heartbeat asserts "the mirror is being written", not
                     # bare process liveness: while any append/manifest IO is
-                    # failing it stays FROZEN so cells and the supervisor see
+                    # failing it stays FROZEN so consumers and the supervisor see
                     # a dead handler, never a quiet market.
                     _log.error(
                         f"feed-handler heartbeat FROZEN: mirror IO failing for "

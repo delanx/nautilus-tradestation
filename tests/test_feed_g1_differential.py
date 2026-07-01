@@ -13,7 +13,7 @@ correction, stale-ignore, gap-fill), a mid-sequence consumer reconnect
 tail-from-end), the STALE-START class (idle/pre-open subscribe, handler
 restart, FeedGapError fresh start on an initialized machine — the proxy must
 never emit a prior bar a direct node would not), and ts_init precedence
-(_ts_bar_emit_ns stamped at the CELL wins over the handler's
+(_ts_bar_emit_ns stamped at the consumer wins over the handler's
 _ts_sse_received_ns — I6).
 """
 import asyncio
@@ -91,7 +91,7 @@ class _StubLogger:
         pass
 
 
-class CellHarness:
+class ConsumerHarness:
     """Runs the data client's REAL bar state machine + emit path.
 
     The methods are the genuine TradeStationDataClient functions (not copies);
@@ -124,8 +124,8 @@ class CellHarness:
         self._handle_bar_stream_event(event, self.bar_type, self.instrument, self.st)
 
 
-def run_direct(events) -> CellHarness:
-    harness = CellHarness()
+def run_direct(events) -> ConsumerHarness:
+    harness = ConsumerHarness()
     for ev in events:
         harness.feed(ev)
     return harness
@@ -171,7 +171,7 @@ def assert_bars_identical(direct, proxy, t0_ns):
         )
         assert p.volume == d.volume
     for bar in list(direct) + list(proxy):
-        # I6: ts_init is the CELL's emit stamp (_ts_bar_emit_ns), never the
+        # I6: ts_init is the consumer's emit stamp (_ts_bar_emit_ns), never the
         # handler's _ts_sse_received_ns (12345) or ts_event.
         assert bar.ts_init >= t0_ns
 
@@ -195,7 +195,7 @@ class TestG1Differential:
         await gen.aclose()
 
         assert got == SEQUENCE  # events cross the transport VERBATIM (I2)
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
         for ev in got:
             proxy.feed(ev)
         assert_bars_identical(direct.emitted, proxy.emitted, t0_ns)
@@ -208,7 +208,7 @@ class TestG1Differential:
 
         handler, st, feed_dir = make_mirror(tmp_path)
         client = FeedTailStreamClient(feed_dir, poll_ms=10)
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
 
         gen = client.stream_bars("ESM26", "15", "Minute")
         task = asyncio.create_task(collect(gen, 5))
@@ -233,7 +233,7 @@ class TestG1Differential:
         assert_bars_identical(direct.emitted, proxy.emitted, t0_ns)
 
     async def test_late_subscriber_seed_parity(self, tmp_path, monkeypatch):
-        """A cell connecting mid-session: the manifest seed + ONLY the events
+        """A consumer connecting mid-session: the manifest seed + ONLY the events
         appended after attach drive the state machine exactly like a
         direct-mode connect (bar E's PRE-subscribe update is not replayed —
         a direct connect would not have it either)."""
@@ -265,7 +265,7 @@ class TestG1Differential:
 
         # Direct equivalent: the same connect-time seed, then the same events.
         direct = run_direct([dict(seed), live_e, live_f])
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
         for ev in got:
             proxy.feed(ev)
         # Both: seed skipped cold (initialized=False), bar E closes at TF.
@@ -275,7 +275,7 @@ class TestG1Differential:
     async def test_fresh_subscribe_during_idle_emits_no_stale_session_bar(
         self, tmp_path, monkeypatch
     ):
-        """G1 at the fleet's mandated restart window: a cell subscribing during
+        """G1 at the fleet's mandated restart window: a consumer subscribing during
         an idle stretch (overnight/pre-open) must NOT replay the previous
         session's final bar M — the state machine would emit it as a live
         closed bar at the next session's first event, which a direct node
@@ -304,7 +304,7 @@ class TestG1Differential:
         assert got[0]["TimeStamp"] == TA  # seed = last PROVEN-complete bar
         assert got[1:] == [nxt]  # bar M's updates were NOT replayed
 
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
         for ev in got:
             proxy.feed(ev)
         # A direct node connecting at the same instant: connect seed + next event.
@@ -348,7 +348,7 @@ class TestG1Differential:
         assert got[0]["TimeStamp"] == TA  # restored manifest seed (last proven close)
         assert got[1:] == [seed_y, nxt]  # M's RealTime updates were NOT replayed
 
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
         for ev in got:
             proxy.feed(ev)
         direct = run_direct([dict(got[0]), seed_y, nxt])
@@ -368,7 +368,7 @@ class TestG1Differential:
         t0_ns = time.time_ns()
         handler, st, feed_dir = make_mirror(tmp_path)
         client = FeedTailStreamClient(feed_dir, poll_ms=10)
-        proxy = CellHarness()
+        proxy = ConsumerHarness()
 
         gen = client.stream_bars("ESM26", "15", "Minute")
         task = asyncio.create_task(collect(gen, 3))

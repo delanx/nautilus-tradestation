@@ -624,7 +624,7 @@ class TestCancelAllOrdersFiltering:
     async def test_venue_confirmed_cancels_suppresses_synthetic_cancel(self, monkeypatch):
         """With TS_VENUE_CONFIRMED_CANCELS=1 the DELETE 200 is only a
         request ack: cancel_order is sent but no synthetic OrderCanceled is
-        generated — the terminal event must come from the venue (V-3 race)."""
+        generated — the terminal event must come from the venue (the concurrent-fill race)."""
         monkeypatch.setenv("TS_VENUE_CONFIRMED_CANCELS", "1")
         order = _make_mock_order("O-1", "TS-700", OrderSide.SELL)
         m = _make_cancel_all_exec_mock(open_orders=[order])

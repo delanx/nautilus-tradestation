@@ -590,7 +590,7 @@ class TestStreamClientSelection:
         """A feed dir outside %LOCALAPPDATA% (e.g. the Drive mount) is fatal (I4)."""
         monkeypatch.delenv("TS_FEED_ALLOW_ANY_DIR", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
-        monkeypatch.setenv("TS_FEED_PROXY", r"jsonl:G:\My Drive\example\feed\SIM1")
+        monkeypatch.setenv("TS_FEED_PROXY", r"jsonl:G:\My Drive\feed\SIM1")
         with pytest.raises(RuntimeError, match="LOCALAPPDATA"):
             self._make_client(loop)
 

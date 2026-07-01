@@ -1,6 +1,6 @@
 """
 Tests for TradeStationExecutionClient order submission / cancel / replace —
-brackets part 1 (resting SL/PT design, `internal
+brackets part 1 (resting SL/PT design).
 
 The client is instantiated with real Nautilus components (msgbus, cache,
 clock) and a mocked HTTP client (AsyncMock methods), so the full
@@ -200,7 +200,7 @@ def _submit_order_list_cmd(orders: list) -> SubmitOrderList:
 
 
 def _oco_bracket_pair(side_to_close: str = "long") -> list:
-    """Build the design §4 OCO pair: StopMarket SL + Limit TP, GTC.
+    """Build the OCO pair: StopMarket SL + Limit TP, GTC.
 
     ``side_to_close="long"`` → SELL legs (SL below entry, TP above);
     ``"short"`` → BUY legs (SL above entry, TP below).
@@ -273,7 +273,7 @@ class TestSubmitRestingOrders:
 
 
 class TestSubmitOcoOrderList:
-    """The §4 OCO pair routes to POST /orderexecution/ordergroups."""
+    """The OCO pair routes to POST /orderexecution/ordergroups."""
 
     async def test_oco_pair_routes_to_group_endpoint(self):
         h = _make_harness()
@@ -317,7 +317,7 @@ class TestSubmitOcoOrderList:
         assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
 
     async def test_equity_oco_cover_legs_use_buy_to_cover(self):
-        # Design §13-1 (EQUITY-GROUP-ORDER class): AAPL is an Equity in the cache, both
+        # Equity short-cover rejection class: AAPL is an Equity in the cache, both
         # legs are tagged close_short BUYs → group payload must say BuyToCover.
         h = _make_harness()
         tags = ["TS_INTENT:close_short", "TS_BRACKET:pod_x:O-ENTRY"]
@@ -355,7 +355,7 @@ class TestSubmitOcoOrderList:
 
 
 class TestGroupLegIdMapping:
-    """Design §13-4 — an unmapped leg is an invisible order: fail loud."""
+    """An unmapped leg is an invisible order: fail loud."""
 
     async def test_leg_missing_order_id_is_rejected(self):
         h = _make_harness()
@@ -475,7 +475,7 @@ class TestModifyOrder:
         assert kwargs["quantity"] == "2"
 
     async def test_replace_equity_cover_keeps_buy_to_cover(self):
-        # EQUITY-GROUP-ORDER class on the replace path: a tagged short-cover stop must
+        # Equity short-cover rejection class on the replace path: a tagged short-cover stop must
         # not flip back to plain 'Buy' when its price is replaced.
         h = _make_harness()
         order = _stop_order(
@@ -542,7 +542,7 @@ class TestCancelOrder:
         assert canceled[0].venue_order_id == VenueOrderId("TS-1")
 
     async def test_cancel_not_open_order_generates_no_event(self):
-        # The deliberate §2 behavior: a concurrent fill must not be masked
+        # The deliberate behavior: a concurrent fill must not be masked
         # by a synthetic cancel — the real fill event resolves the order.
         h = _make_harness()
         order = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"])

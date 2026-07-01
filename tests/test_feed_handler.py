@@ -111,7 +111,7 @@ class TestEndToEnd:
             manifest_path = feed_dir / protocol.BARS_DIR / KEY / protocol.MANIFEST_NAME
             await wait_until(lambda: (protocol.read_json(manifest_path) or {}).get("join"))
 
-            # SUBSCRIBE: two cells tail the same key. Fresh start = seed +
+            # SUBSCRIBE: two consumers tail the same key. Fresh start = seed +
             # tail-from-end: T+1's PRE-subscribe update is NOT replayed
             # (direct-connect parity; a stale replay would break G1).
             client_a = FeedTailStreamClient(feed_dir, poll_ms=10)
@@ -134,7 +134,7 @@ class TestEndToEnd:
             assert got_a[0]["Close"] == "4121.5"
             assert got_a[1] == live  # T+1's pre-subscribe update was not replayed
 
-            # DEDUP: three request drops (hand + two cells) -> ONE upstream stream.
+            # DEDUP: three request drops (hand + two consumers) -> ONE upstream stream.
             assert fake.calls == [("ESM26", "15", "Minute", None)]
 
             # REPLAY: kill A's generator, push more, re-enter -> exactly once.
@@ -215,7 +215,7 @@ class TestIngestHealth:
         self, tmp_path, monkeypatch
     ):
         # Disk-full class: appends fail but the process is alive. The heartbeat
-        # must FREEZE (cells read silence as handler-dead, never quiet market)
+        # must FREEZE (consumers read silence as handler-dead, never quiet market)
         # and thaw on the next successful append.
         monkeypatch.setenv("TS_FEED_ALLOW_ANY_DIR", "1")
         fake = FakeStreamClient()
@@ -266,14 +266,14 @@ class TestKeyRetirement:
             write_request(feed_dir, "ESM26", "15", "Minute", None)
             await wait_until(lambda: KEY in handler._ingests)
             assert len(fake.calls) == 1
-            # No cell re-stamps the lease: past the TTL the key is retired
+            # No consumer re-stamps the lease: past the TTL the key is retired
             # (upstream subscription dropped, writer closed, lease deleted).
             old = time.time() - 5.0
             os.utime(req, (old, old))
             await wait_until(lambda: KEY not in handler._ingests)
             assert KEY not in handler._ingest_tasks
             assert not req.exists()
-            # A cell coming back re-leases and gets a fresh ingest.
+            # A consumer coming back re-leases and gets a fresh ingest.
             write_request(feed_dir, "ESM26", "15", "Minute", None)
             await wait_until(lambda: KEY in handler._ingests)
             await wait_until(lambda: len(fake.calls) == 2)  # upstream re-subscribed
@@ -327,7 +327,7 @@ class TestKeyRetirement:
             await wait_until(lambda: req.with_name(f"{req.name}.bad").exists())
             alert = tmp_path / "alerts" / f"feed_request_conflict_SIMTEST_{KEY}.json"
             await wait_until(alert.exists)
-            # The running ingest is untouched; the conflicting cell is NOT served.
+            # The running ingest is untouched; the conflicting consumer is NOT served.
             assert KEY in handler._ingests
             assert handler._ingests[KEY].symbol == "ESM26"
             assert fake.calls == [("ESM26", "15", "Minute", None)]

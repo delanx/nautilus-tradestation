@@ -61,7 +61,7 @@ def intent_from_tags(order: Order) -> str | None:
     Submitting strategies tag orders with their intent (e.g.
     ``TS_INTENT:close_short``) so the adapter can choose the correct
     TradeStation TradeAction without inferring from cached position state
-    (the SPY EQUITY-GROUP-ORDER 'boxed position' lesson — the cache can be wrong).
+    (a boxed-position lesson — the cache can be wrong).
 
     Parameters
     ----------
@@ -219,7 +219,7 @@ def resolve_trigger_price(ts_order: dict) -> str | None:
 
     TradeStation carries the stop trigger as top-level ``StopPrice`` —
     confirmed against live SIM captures of both ``/orders`` and
-    ``/historicalorders`` (2026-06-11, account SIM0000001F: every StopMarket
+    ``/historicalorders`` (every StopMarket
     payload, open or terminal, had top-level ``StopPrice``).  Defensively we
     also accept ``TriggerPrice`` (alternate spelling) and ``Legs[*].StopPrice``
     (the same Legs-only schema quirk as Symbol/Quantity/ExecutionPrice).
@@ -489,8 +489,8 @@ def convert_order_list_to_ts_group(
     is_equity : Callable[[Order], bool], optional
         Predicate returning ``True`` when an order's instrument is an equity.
         When provided, equity legs honor ``TS_INTENT`` tags so short-cover
-        legs go out as ``BuyToCover`` instead of plain ``Buy`` (the SPY EQUITY-GROUP-ORDER
-        rejection class — design §13-1). When ``None`` (default) payloads are
+        legs go out as ``BuyToCover`` instead of plain ``Buy`` (the equity short-cover
+        rejection class). When ``None`` (default) payloads are
         byte-identical to the previous behavior.
 
     Returns
@@ -516,7 +516,7 @@ def convert_order_list_to_ts_group(
             "TradeAction": params["trade_action"],
             "TimeInForce": {"Duration": params["time_in_force"]},
         }
-        # Equity legs honor TS_INTENT tags (EQUITY-GROUP-ORDER class, design §13-1):
+        # Equity legs honor TS_INTENT tags (equity short-cover rejection class):
         # without this an equity short-cover leg goes out plain 'Buy' and
         # is rejected by TradeStation. Futures keep plain Buy/Sell.
         if is_equity is not None and is_equity(order):

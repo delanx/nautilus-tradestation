@@ -51,7 +51,7 @@ class TestStreamKeySanitization:
 
     def test_sanitization_collisions_disambiguated_by_hash(self):
         # '@ES' and '=ES' both sanitize to '_ES'; the raw-tuple hash keeps the
-        # keys distinct so two cells can never silently share a stream.
+        # keys distinct so two consumers can never silently share a stream.
         assert stream_key("@ES", "15", "Minute", None) != stream_key("=ES", "15", "Minute", None)
         assert stream_key("AAPL", "15", "Minute", "US/EQ") != stream_key(
             "AAPL", "15", "Minute", "US EQ"

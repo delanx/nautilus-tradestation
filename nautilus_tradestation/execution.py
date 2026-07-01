@@ -81,7 +81,7 @@ def _venue_confirmed_cancels_enabled() -> bool:
     canceled in).  Synthesizing ``OrderCanceled`` on the 200 makes the order
     terminal in Nautilus, so the real SSE ``FLL`` that follows is dropped by
     the ``is_closed`` gate -- leg fill + a released market exit double-fill the
-    position (DESIGN.md §7 / checklist V-3).  With the flag set
+    position (the concurrent-fill race window).  With the flag set
     the cancel only becomes terminal on the venue's own CAN event (SSE stream,
     status poll, or a one-shot order-status query).  Unset (the default) keeps
     today's synthetic-cancel behavior byte-identical.
@@ -671,7 +671,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         orders = command.order_list.orders
 
         # Try group submission first. The equity predicate lets group legs
-        # honor TS_INTENT tags (EQUITY-GROUP-ORDER class — design §13-1): an equity
+        # honor TS_INTENT tags (equity short-cover rejection class): an equity
         # short-cover leg must go out as BuyToCover, never plain Buy.
         group_result = convert_order_list_to_ts_group(
             orders,
@@ -734,7 +734,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_order_resp = ts_orders[i] if i < len(ts_orders) else {}
                 ts_order_id = ts_order_resp.get("OrderID")
                 if not ts_order_id:
-                    # REJECTION-PATH ALERT (design §13-4): an unmapped leg is
+                    # REJECTION-PATH ALERT: an unmapped leg is
                     # an INVISIBLE resting order — its fill/cancel events would
                     # be silently dropped by the session ID-map gate. Fail loud
                     # so the strategy's rejection handling (retry-once →
@@ -820,8 +820,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
             ts_order_type = self._convert_order_type(order)
             ts_tif = self._convert_time_in_force(order.time_in_force)
             ts_side = "Buy" if order.side == OrderSide.BUY else "Sell"
-            # Equity covers must keep their TradeAction on replace (EQUITY-GROUP-ORDER
-            # class): replacing a BuyToCover leg with plain 'Buy' would be
+            # Equity covers must keep their TradeAction on replace (equity short-cover
+            # rejection class): replacing a BuyToCover leg with plain 'Buy' would be
             # rejected by TradeStation. Futures keep plain Buy/Sell.
             if self._is_equity_order(order):
                 intent_action = equity_trade_action_from_intent(order)
@@ -939,7 +939,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # terminal state: the order can still FILL inside the race
                 # window.  Synthesizing OrderCanceled here would close the
                 # order in Nautilus and the racing real fill would be dropped
-                # by the is_closed gate (double-fill class, design §7/V-3).
+                # by the is_closed gate (double-fill class).
                 # The venue's own CAN (SSE / status poll / one-shot query)
                 # makes it terminal.
                 self._log.info(
@@ -1035,7 +1035,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Same venue-confirmed-cancel semantics as _cancel_order: with
                 # the flag set, the DELETE 200 is only a request ack — the
                 # terminal OrderCanceled must come from the venue's own CAN
-                # event (SSE/poll), never synthesized here (V-3 race class).
+                # event (SSE/poll), never synthesized here (concurrent-fill race class).
                 if not _venue_confirmed_cancels_enabled():
                     self.generate_order_canceled(
                         strategy_id=command.strategy_id,
@@ -1556,7 +1556,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
             if isinstance(instrument, Equity):
                 # For equities, TS requires SellShort/BuyToCover for short positions.
-                # AUTHORITY ORDER (bug: SPY EQUITY-GROUP-ORDER 'boxed position' 2026-06-10): the
+                # AUTHORITY ORDER (a boxed-position bug): the
                 # submitting strategy KNOWS its intent and tags the order
                 # (TS_INTENT:close_short / close_long / open). The cache inference
                 # below stays as fallback only -- the Nautilus cache showed FLAT

@@ -323,8 +323,8 @@ class TestStopReportTriggerPriceHardening:
 
     @staticmethod
     def _venue_stop_payload(**overrides) -> dict:
-        """Real SIM /orders payload shape (order 956686661, captured
-        2026-06-11; see internal
+        """Real SIM /orders payload shape (a real StopMarket OCO
+        leg, REJ status)."""
         payload = {
             "OrderID": "956686661",
             "Status": "REJ",

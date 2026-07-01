@@ -109,13 +109,13 @@ class TestFromEnv:
         monkeypatch.delenv("TS_FEED_ALLOW_ANY_DIR", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
         with pytest.raises(RuntimeError, match="LOCALAPPDATA"):
-            FeedTailStreamClient.from_env(r"jsonl:G:\My Drive\example\feed\SIM1")
+            FeedTailStreamClient.from_env(r"jsonl:G:\My Drive\feed\SIM1")
 
     def test_localappdata_path_accepted(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TS_FEED_ALLOW_ANY_DIR", raising=False)
         local = tmp_path / "AppData" / "Local"
         monkeypatch.setenv("LOCALAPPDATA", str(local))
-        client = FeedTailStreamClient.from_env(f"jsonl:{local / 'example' / 'feed' / 'SIM1'}")
+        client = FeedTailStreamClient.from_env(f"jsonl:{local / 'feed' / 'SIM1'}")
         assert isinstance(client, FeedTailStreamClient)
 
     def test_allow_any_dir_escape(self, tmp_path, monkeypatch):

@@ -289,10 +289,10 @@ class TestIntentHelpers:
 
 
 class TestEquityIntentInGroupPayloads:
-    """Design §13-1 — equity group legs honor TS_INTENT tags (EQUITY-GROUP-ORDER class).
+    """Equity group legs honor TS_INTENT tags (equity short-cover rejection class).
 
     An equity short-cover leg must go out as BuyToCover; the plain converter
-    would send 'Buy' and TradeStation would reject it (the SPY EQUITY-GROUP-ORDER bug).
+    would send 'Buy' and TradeStation would reject it (the equity short-cover rejection).
     Futures legs must keep plain Buy/Sell regardless of tags.
     """
 

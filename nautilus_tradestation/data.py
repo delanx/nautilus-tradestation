@@ -112,7 +112,7 @@ class TradeStationDataClient(LiveMarketDataClient):
 
             feed_proxy = os.environ.get("TS_FEED_PROXY", "")
             if feed_proxy:
-                # Cell/proxy mode: bar subscriptions tail the account feed
+                # Consumer/proxy mode: bar subscriptions tail the account feed
                 # handler's local JSONL mirror instead of opening their own TS
                 # SSE bar streams. FeedTailStreamClient duck-types stream_*, so
                 # everything downstream (_stream_bars supervise loop, the bar

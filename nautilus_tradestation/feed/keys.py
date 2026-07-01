@@ -1,8 +1,8 @@
 """
-Stream-key encoding for the example feed transport.
+Stream-key encoding for the feed transport.
 
 The single shared source for both sides of the transport (handler = writer,
-cells = readers) so key drift is impossible. Inputs are exactly the four
+consumers = readers) so key drift is impossible. Inputs are exactly the four
 arguments of ``TradeStationStreamClient.stream_bars``.
 """
 

@@ -7,7 +7,7 @@ Three env-gated fixes, each byte-identical when its flag is unset:
    ``OrderCanceled`` on a REST DELETE 200 (a cancel REQUEST ack).  The venue's
    own CAN event (SSE / status poll / one-shot query) makes the order terminal,
    so a fill racing the cancel can no longer be dropped by the ``is_closed``
-   gate (DESIGN.md §7 / checklist V-3).
+   gate (the concurrent-fill race window).
 2. ``TS_STREAM_FILL_HARDENING=1`` — ``_process_order_event`` /
    ``_check_order_statuses`` record ``_order_last_status`` only AFTER an event
    is successfully processed (the zero-price FLL skip no longer poisons the

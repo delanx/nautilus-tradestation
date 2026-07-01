@@ -1,12 +1,12 @@
 """
-Cell-side tail client for the example feed transport.
+Consumer-side tail client for the feed transport.
 
 ``FeedTailStreamClient`` is a drop-in replacement for
 ``TradeStationStreamClient`` on the data path: ``stream_bars`` poll-tails the
 per-key JSONL mirror written by the account's feed handler instead of opening
 its own TradeStation SSE connection. Event dicts cross VERBATIM (values are the
 exact strings TS sent). The other ``stream_*`` methods delegate to a lazily
-built real client (no client P6 code subscribes ticks; delegation keeps the
+built real client (no client code subscribes ticks; delegation keeps the
 stream-client contract whole).
 
 Feed exceptions are plain ``RuntimeError`` subclasses so the data client's
@@ -57,7 +57,7 @@ class FeedTailStreamClient:
 
     Cursors live on the CLIENT INSTANCE (like ``_last_bar_ts`` on the data
     client) because the supervise loop creates a NEW async generator per
-    resubscribe; they are in-memory only — a restarted cell process is
+    resubscribe; they are in-memory only — a restarted consumer process is
     cursor-less BY DESIGN (= direct-mode cold-connect parity).
     """
 
@@ -130,7 +130,7 @@ class FeedTailStreamClient:
 
         cursor = self._cursors.get(key)
         if cursor is not None:
-            # RESUME: generator re-entered after a raise, cell process still alive.
+            # RESUME: generator re-entered after a raise, consumer process still alive.
             segment, offset, last_seq = cursor
             try:
                 size = os.stat(key_dir / protocol.segment_name(segment)).st_size
@@ -245,7 +245,7 @@ class FeedTailStreamClient:
                     idle_since = time.monotonic()  # alive but quiet: re-check periodically
             if time.monotonic() - last_lease >= self._request_refresh_secs:
                 # The request file is a lease: re-stamp it so the handler can
-                # retire keys NO live cell wants (protocol.REQUEST_TTL_SECS).
+                # retire keys NO live consumer wants (protocol.REQUEST_TTL_SECS).
                 self._write_request(key, symbol, interval, unit, session_template)
                 last_lease = time.monotonic()
             await asyncio.sleep(self._poll_secs)
@@ -257,7 +257,7 @@ class FeedTailStreamClient:
             yield event
 
     async def stream_orders(self, account_id: str) -> AsyncIterator[dict]:
-        # Defensive: the exec client owns its own stream client (per-cell, direct).
+        # Defensive: the exec client owns its own stream client (per-consumer, direct).
         async for event in self._real().stream_orders(account_id):
             yield event
 
@@ -279,7 +279,7 @@ class FeedTailStreamClient:
     def _write_request(
         self, key: str, symbol: str, interval: str, unit: str, session_template: str | None
     ) -> None:
-        """Drop/refresh the subscription request (idempotent; cross-cell
+        """Drop/refresh the subscription request (idempotent; cross-consumer
         collisions are benign — identical semantic content). Re-stamped every
         ``request_refresh_secs`` while streaming: the file doubles as the
         liveness lease the handler's key retirement checks."""
