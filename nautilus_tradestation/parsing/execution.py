@@ -96,11 +96,16 @@ def equity_trade_action_from_intent(order: Order) -> str | None:
     Returns
     -------
     str | None
-        ``"BuyToCover"`` for a tagged short-cover BUY, ``"Sell"`` for a
-        tagged long-close SELL, or ``None`` when no intent tag applies
-        (caller keeps its default Buy/Sell action).
+        ``"SellShort"`` for a tagged short-open SELL, ``"BuyToCover"`` for a
+        tagged short-cover BUY, ``"Sell"`` for a tagged long-close SELL,
+        ``"Buy"`` for a tagged long-open BUY, or ``None`` when no intent tag
+        applies (caller keeps its default Buy/Sell action).
     """
     intent = intent_from_tags(order)
+    if intent == "open_short" and order.side == OrderSide.SELL:
+        return "SellShort"
+    if intent == "open_long" and order.side == OrderSide.BUY:
+        return "Buy"
     if intent == "close_short" and order.side == OrderSide.BUY:
         return "BuyToCover"
     if intent == "close_long" and order.side == OrderSide.SELL:

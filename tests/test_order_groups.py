@@ -73,19 +73,21 @@ def _limit_order(coid: str, side: OrderSide, price: float,
 def _market_order(coid: str, side: OrderSide,
                   contingency: ContingencyType = ContingencyType.OTO,
                   order_list_id: str = "OL-001",
-                  linked: list[str] | None = None):
+                  linked: list[str] | None = None,
+                  tags: list[str] | None = None):
     from nautilus_trader.model.orders import MarketOrder
     return MarketOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
         instrument_id=_INSTRUMENT_ID,
         client_order_id=ClientOrderId(coid),
-        order_side=OrderSide.BUY,
+        order_side=side,
         quantity=Quantity.from_int(1),
         time_in_force=TimeInForce.DAY,
         init_id=_uid(), ts_init=0,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
@@ -269,6 +271,16 @@ class TestIntentHelpers:
         o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
                         tags=["TS_INTENT:close_short"])
         assert equity_trade_action_from_intent(o) == "BuyToCover"
+
+    def test_open_short_sell_maps_to_sell_short(self):
+        o = _market_order("O-ENTRY", OrderSide.SELL, ContingencyType.NO_CONTINGENCY,
+                          tags=["TS_INTENT:open_short"])
+        assert equity_trade_action_from_intent(o) == "SellShort"
+
+    def test_open_long_buy_maps_to_buy(self):
+        o = _market_order("O-ENTRY", OrderSide.BUY, ContingencyType.NO_CONTINGENCY,
+                          tags=["TS_INTENT:open_long"])
+        assert equity_trade_action_from_intent(o) == "Buy"
 
     def test_close_long_sell_maps_to_sell(self):
         o = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"],

@@ -1558,7 +1558,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # For equities, TS requires SellShort/BuyToCover for short positions.
                 # AUTHORITY ORDER (a boxed-position bug): the
                 # submitting strategy KNOWS its intent and tags the order
-                # (TS_INTENT:close_short / close_long / open). The cache inference
+                # (TS_INTENT:close_short / close_long / open_short / open_long).
+                # The cache inference
                 # below stays as fallback only -- the Nautilus cache showed FLAT
                 # while the account was short 100 SPY (a dropped/unparsed status
                 # report), so a flatten BUY went out as plain 'Buy' and was
