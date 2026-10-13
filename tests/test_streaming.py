@@ -202,7 +202,7 @@ class TestStreamEventParsing:
             {"Status": "RealTime", "Open": 3350.0, "Close": 3355.0},
         ]
 
-        async def fake_stream(url: str):
+        async def fake_stream(url: str, params: dict | None = None):
             for evt in raw:
                 yield evt
 
@@ -243,11 +243,11 @@ class TestStreamEventParsing:
 class TestStreamClientConfig:
     """Config fields propagate to the streaming layer correctly."""
 
-    def test_use_streaming_false_by_default(self):
+    def test_use_streaming_true_by_default(self):
         """The config default keeps streaming off."""
         from nautilus_tradestation.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
-        assert cfg.use_streaming is False
+        assert cfg.use_streaming is True
 
     def test_use_streaming_can_be_enabled(self):
         from nautilus_tradestation.config import TradeStationDataClientConfig

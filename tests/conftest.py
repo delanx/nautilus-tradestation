@@ -65,3 +65,29 @@ def exec_client():
 def account_state():
     """Placeholder — not used in provider tests."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _api_budget_hooks_inert_by_default(monkeypatch):
+    """Keep the optional host hooks INERT for this repo's whole suite unless a
+    test opts in.
+
+    ``nautilus_tradestation/http/budget.py`` imports the module named by
+    ``TRADESTATION_BUDGET_MODULE`` and ``execution._report_order_feed_state``
+    calls the function named by ``TRADESTATION_ORDER_FEED_HOOK``. If either
+    variable happens to be set in the environment that runs these tests, an
+    unguarded suite would resolve the REAL host module and every mocked REST
+    call would be journaled into that host's production measurements.
+
+    Clearing both variables and pinning ``_MODULE = None`` makes the
+    documented standalone behavior -- "no host module, every hook is a
+    no-op" -- the suite's default; ``tests/test_api_budget_hooks.py`` and
+    ``tests/test_order_feed_seam.py`` install their own fakes where they need
+    the hooks live.
+    """
+    monkeypatch.delenv("TRADESTATION_BUDGET_MODULE", raising=False)
+    monkeypatch.delenv("TRADESTATION_ORDER_FEED_HOOK", raising=False)
+    from nautilus_tradestation.http import budget as _budget_mod
+
+    monkeypatch.setattr(_budget_mod, "_MODULE", None)
+    monkeypatch.setattr(_budget_mod, "_RESOLVED", True)

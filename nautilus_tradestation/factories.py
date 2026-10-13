@@ -25,6 +25,7 @@ def get_cached_tradestation_http_client(
     refresh_token: str | None = None,
     use_sandbox: bool = False,
     base_url: str | None = None,
+    allow_custom_base_url: bool = False,
 ) -> TradeStationHttpClient:
     """
     Create or return a cached TradeStation HTTP client.
@@ -43,6 +44,8 @@ def get_cached_tradestation_http_client(
         If True, use sandbox API.
     base_url : str, optional
         Override base URL.
+    allow_custom_base_url : bool, default False
+        If True, skip hostname validation on base_url.
 
     Return -------
     TradeStationHttpClient
@@ -55,6 +58,7 @@ def get_cached_tradestation_http_client(
         refresh_token=refresh_token,
         use_sandbox=use_sandbox,
         base_url=base_url,
+        allow_custom_base_url=allow_custom_base_url,
     )
 
 
@@ -65,6 +69,7 @@ def get_cached_tradestation_instrument_provider(
     refresh_token: str | None = None,
     use_sandbox: bool = False,
     base_url: str | None = None,
+    allow_custom_base_url: bool = False,
 ) -> TradeStationInstrumentProvider:
     """
     Create or return a cached TradeStation instrument provider.
@@ -81,6 +86,8 @@ def get_cached_tradestation_instrument_provider(
         If True, use sandbox API.
     base_url : str, optional
         Override base URL.
+    allow_custom_base_url : bool, default False
+        If True, skip hostname validation on base_url.
 
     Return -------
     TradeStationInstrumentProvider
@@ -93,6 +100,7 @@ def get_cached_tradestation_instrument_provider(
         refresh_token=refresh_token,
         use_sandbox=use_sandbox,
         base_url=base_url,
+        allow_custom_base_url=allow_custom_base_url,
     )
 
     return TradeStationInstrumentProvider(client=http_client)
@@ -142,6 +150,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Get or create instrument provider (cached)
@@ -151,6 +160,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Create and return data client
@@ -164,6 +174,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             instrument_ids=config.instrument_ids,
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
+            extended_hours=config.extended_hours,
         )
 
 
@@ -211,6 +222,7 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Get or create instrument provider (cached)
@@ -220,6 +232,7 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Create and return execution client
@@ -234,4 +247,16 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             base_url_ws=config.base_url_ws,
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
+            extended_hours=config.extended_hours,
+            # T-2 order-map persistence: this field has existed on
+            # TradeStationExecClientConfig since its introduction but was never
+            # forwarded to the constructor, so it was permanently inert (every
+            # exec client ran with a cold order map every restart regardless of
+            # config). Completed here alongside Shared-account reconciliation scoping
+            # since a durable order map is what lets a scoped client still recognize
+            # its OWN still-open orders across a restart.
+            order_map_path=config.order_map_path,
+            scope_reconciliation_to_known_orders=(
+                config.scope_reconciliation_to_known_orders
+            ),
         )

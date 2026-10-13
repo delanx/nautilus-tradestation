@@ -7,7 +7,12 @@ import pandas as pd
 
 from nautilus_trader.model.enums import AssetClass, OptionKind
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-from nautilus_trader.model.instruments import Equity, FuturesContract, OptionContract
+from nautilus_trader.model.instruments import (
+    Equity,
+    FuturesContract,
+    IndexInstrument,
+    OptionContract,
+)
 from nautilus_trader.model.objects import Currency, Price, Quantity
 
 
@@ -18,7 +23,7 @@ def parse_instrument(
     symbol: str,
     data: dict,
     venue: Venue,
-) -> Equity | FuturesContract | OptionContract | None:
+) -> Equity | FuturesContract | OptionContract | IndexInstrument | None:
     """Parse a TradeStation symbol-details dict into a NautilusTrader instrument.
 
     Parameters
@@ -94,6 +99,27 @@ def parse_instrument(
         elif asset_type == "OPTION":
             return _parse_option(symbol, data, instrument_id, price_increment,
                                  price_precision, lot_size, ts_event)
+
+        elif asset_type == "INDEX":
+            # Cash index ($NDX.X, $VIX.X, $SPX.X): DATA-ONLY. Without this branch
+            # the provider returned None ("Failed to parse instrument"), the data
+            # client refused the bar subscription for lack of a cached instrument,
+            # and a strategy whose second data series is an index silently
+            # received no live bars.
+            # IndexInstrument is nautilus' non-tradable spot-index type: bars
+            # stream normally; it can never back an order.
+            size_increment = Quantity.from_int(1)
+            return IndexInstrument(
+                instrument_id=instrument_id,
+                raw_symbol=Symbol(data.get("Symbol", symbol)),
+                currency=Currency.from_str(data.get("Currency", "USD")),
+                price_precision=price_precision,
+                size_precision=size_increment.precision,
+                price_increment=price_increment,
+                size_increment=size_increment,
+                ts_event=ts_event,
+                ts_init=ts_init,
+            )
 
         else:
             _log.warning(f"Unsupported asset type '{asset_type}' for symbol {symbol}")

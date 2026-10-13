@@ -29,14 +29,16 @@ Usage
         print(event)  # dict with OrderID, Status, etc.
 
 """
+
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from typing import Callable
 
 import httpx
-
 
 _log = logging.getLogger(__name__)
 
@@ -57,6 +59,10 @@ class TradeStationStreamClient:
     access_token_provider : Callable[[], str | None]
         Zero-argument callable that returns the current OAuth access token.
         Called on each (re)connection so tokens refresh transparently.
+    access_token_refresher : Callable[[bool], Awaitable[str | None]], optional
+        Async callable used to obtain a valid token before opening an SSE
+        connection. When supplied, 401 responses force-refresh through this
+        callback before reconnecting.
     base_url : str
         TradeStation API base URL (sandbox or production).
     reconnect_delay_secs : float, default 5.0
@@ -70,8 +76,10 @@ class TradeStationStreamClient:
         access_token_provider: Callable[[], str | None],
         base_url: str,
         reconnect_delay_secs: float = 5.0,
+        access_token_refresher: Callable[[bool], Awaitable[str | None]] | None = None,
     ) -> None:
         self._token_provider = access_token_provider
+        self._token_refresher = access_token_refresher
         self._base_url = base_url.rstrip("/")
         self._reconnect_delay = reconnect_delay_secs
         self._max_delay = reconnect_delay_secs * 8
@@ -83,13 +91,48 @@ class TradeStationStreamClient:
             "Accept": "application/vnd.tradestation.streams.v2+json",
         }
 
-    async def _stream(self, url: str) -> AsyncIterator[dict]:
+    async def _headers_async(self, *, force_refresh: bool = False) -> dict[str, str]:
+        if self._token_refresher is not None:
+            token = await self._token_refresher(force_refresh)
+        else:
+            token = self._token_provider()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.tradestation.streams.v2+json",
+        }
+
+    async def _stream(
+        self, url: str, params: dict[str, str] | None = None,
+    ) -> AsyncIterator[dict]:
         """Core SSE reader — yields parsed JSON dicts, reconnects on error."""
         delay = self._reconnect_delay
         while True:
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream("GET", url, headers=self._headers()) as resp:
+                    headers = await self._headers_async()
+                    async with client.stream(
+                        "GET", url, headers=headers, params=params,
+                    ) as resp:
+                        if resp.status_code == 401:
+                            body = await resp.aread()
+                            _log.warning(
+                                f"SSE stream {url} returned 401; "
+                                "forcing token refresh before reconnect. "
+                                f"Body: {body.decode(errors='replace')[:200]}"
+                            )
+                            if self._token_refresher is not None:
+                                try:
+                                    await self._headers_async(force_refresh=True)
+                                    delay = self._reconnect_delay
+                                    continue
+                                except Exception as e:
+                                    _log.error(
+                                        f"SSE token refresh failed ({url}): {e} "
+                                        f"— reconnecting in {delay:.0f}s"
+                                    )
+                            await asyncio.sleep(delay)
+                            delay = min(delay * 2, self._max_delay)
+                            continue
                         if resp.status_code != 200:
                             body = await resp.aread()
                             _log.error(
@@ -104,6 +147,7 @@ class TradeStationStreamClient:
                         delay = self._reconnect_delay  # reset on successful connect
 
                         async for line in resp.aiter_lines():
+                            received_ns = time.time_ns()
                             line = line.strip()
                             if not line:
                                 continue
@@ -117,13 +161,16 @@ class TradeStationStreamClient:
                             if any(k in event for k in _HEARTBEAT_KEYS):
                                 continue
 
+                            event["_ts_sse_received_ns"] = received_ns
                             yield event
 
             except asyncio.CancelledError:
                 _log.info(f"SSE stream cancelled: {url}")
                 return
             except Exception as e:
-                _log.error(f"SSE stream error ({url}): {e} — reconnecting in {delay:.0f}s")
+                _log.error(
+                    f"SSE stream error ({url}): {e} — reconnecting in {delay:.0f}s"
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._max_delay)
 
@@ -152,6 +199,7 @@ class TradeStationStreamClient:
         symbol: str,
         interval: str,
         unit: str,
+        session_template: str | None = None,
     ) -> AsyncIterator[dict]:
         """
         Stream real-time bar updates for a symbol.
@@ -164,6 +212,9 @@ class TradeStationStreamClient:
             Bar interval string (e.g. ``"1"``, ``"5"``, ``"15"``).
         unit : str
             Bar unit: ``"Minute"`` or ``"Daily"``.
+        session_template : str, optional
+            TS session template. Use ``"USEQPreAndPost"`` for extended hours
+            equity bars. Default ``None`` uses TS default (RTH only for equities).
 
         Yields
         ------
@@ -173,8 +224,10 @@ class TradeStationStreamClient:
 
         """
         url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
-        params = f"?interval={interval}&unit={unit}&barsback=1"
-        async for event in self._stream(url + params):
+        params: dict[str, str] = {"interval": interval, "unit": unit, "barsback": "1"}
+        if session_template:
+            params["sessiontemplate"] = session_template
+        async for event in self._stream(url, params=params):
             # Pass all events through — including Historical seed bars.
             # The caller (_stream_bars) uses them for reconnection gap recovery.
             yield event

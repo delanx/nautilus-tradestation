@@ -28,11 +28,11 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
 
     def __init__(self) -> None:
         self.client_id = "mock_client_id"
-        self.client_secret = "mock_secret"
-        self.refresh_token = "mock_refresh"
+        self._client_secret = "mock_secret"
+        self._refresh_token = "mock_refresh"
         self.auth_url = "https://mock.tradestation.com/oauth/token"
         self.base_url = "https://mock.tradestation.com/v3"
-        self.access_token = "mock_access_token"
+        self._access_token = "mock_access_token"
         self.token_expiry = datetime.max
         # No real httpx client — tests never touch the network
         self._httpx = None  # type: ignore[assignment]
@@ -80,6 +80,13 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
             json.loads((_RESOURCES / "order_stop_filled.json").read_text()),
             json.loads((_RESOURCES / "order_canceled.json").read_text()),
         ]
+
+    async def get_orders_by_ids(
+        self, account_keys: str, order_ids: str,
+    ) -> list[dict[str, Any]]:
+        wanted = set(order_ids.split(","))
+        orders = await self.get_orders(account_keys)
+        return [o for o in orders if o.get("OrderID") in wanted]
 
     async def place_order_group(
         self, group_type: str, orders: list[dict[str, Any]],

@@ -25,6 +25,8 @@ from nautilus_tradestation.constants import TRADESTATION_VENUE
 from nautilus_tradestation.data import TradeStationDataClient
 from nautilus_tradestation.factories import TradeStationLiveDataClientFactory
 from nautilus_tradestation.factories import TradeStationLiveExecClientFactory
+from nautilus_tradestation.http.client import DuplicateOrderConfirmIdException
+from nautilus_tradestation.http.client import OrderRejectedException
 from nautilus_tradestation.http.client import TradeStationHttpClient
 from nautilus_tradestation.providers import TradeStationInstrumentProvider
 
@@ -33,6 +35,8 @@ __all__ = [
     "TRADESTATION",
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",
+    "DuplicateOrderConfirmIdException",
+    "OrderRejectedException",
     "TradeStationDataClient",
     "TradeStationDataClientConfig",
     "TradeStationExecClientConfig",
