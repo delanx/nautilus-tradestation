@@ -1,12 +1,12 @@
 {
   "AccountID": "SIM0000001F",
   "AccountType": "Futures",
-  "CashBalance": "100000.00",
-  "Equity": "100250.00",
-  "MarketValue": "72500.00",
-  "TodaysProfitLoss": "250.00",
-  "UnrealizedProfitLoss": "250.00",
-  "InitialMargin": "15000.00",
-  "MaintenanceMargin": "12000.00",
+  "CashBalance": "50000.00",
+  "Equity": "51000.00",
+  "MarketValue": "25000.00",
+  "TodaysProfitLoss": "1000.00",
+  "UnrealizedProfitLoss": "1000.00",
+  "InitialMargin": "10000.00",
+  "MaintenanceMargin": "8000.00",
   "Currency": "USD"
 }

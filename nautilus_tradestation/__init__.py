@@ -2,7 +2,7 @@
 TradeStation adapter for NautilusTrader.
 
 Provides live market data and order execution for TradeStation via their REST and
-SSE streaming APIs.  Production-tested with 20+ concurrent futures strategies.
+SSE streaming APIs.
 
 Supported:
 - Async HTTP client (httpx) — no blocking calls on the event loop
@@ -25,6 +25,8 @@ from nautilus_tradestation.constants import TRADESTATION_VENUE
 from nautilus_tradestation.data import TradeStationDataClient
 from nautilus_tradestation.factories import TradeStationLiveDataClientFactory
 from nautilus_tradestation.factories import TradeStationLiveExecClientFactory
+from nautilus_tradestation.http.client import DuplicateOrderConfirmIdException
+from nautilus_tradestation.http.client import OrderRejectedException
 from nautilus_tradestation.http.client import TradeStationHttpClient
 from nautilus_tradestation.providers import TradeStationInstrumentProvider
 
@@ -33,6 +35,8 @@ __all__ = [
     "TRADESTATION",
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",
+    "DuplicateOrderConfirmIdException",
+    "OrderRejectedException",
     "TradeStationDataClient",
     "TradeStationDataClientConfig",
     "TradeStationExecClientConfig",

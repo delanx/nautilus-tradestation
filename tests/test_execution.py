@@ -6,10 +6,12 @@ instantiation is needed. Command-object tests verify that the execution
 client methods accept the correct NautilusTrader command types.
 """
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nautilus_tradestation.execution import (
+    TradeStationExecutionClient,
     convert_time_in_force,
     parse_order_status,
     parse_order_status_report,
@@ -21,9 +23,20 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
+    ModifyOrder,
 )
 from nautilus_trader.model.enums import OrderStatus, OrderType, TimeInForce
-from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, VenueOrderId
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientOrderId,
+    InstrumentId,
+    StrategyId,
+    Symbol,
+    TraderId,
+    Venue,
+    VenueOrderId,
+)
+from nautilus_trader.model.objects import Price, Quantity
 from tests.test_kit import TSTestOrderStubs
 
 
@@ -165,6 +178,12 @@ class TestPositionStubs:
         es = next(p for p in TSTestOrderStubs.positions() if p["Symbol"] == "ESM26")
         assert float(es["Quantity"]) < 0
 
+    def test_positions_have_average_price(self):
+        """Every position fixture entry must carry AveragePrice so avg_px_open is populated."""
+        for pos in TSTestOrderStubs.positions():
+            assert "AveragePrice" in pos, f"Missing AveragePrice in {pos}"
+            assert float(pos["AveragePrice"]) > 0, f"AveragePrice must be > 0, got {pos}"
+
 
 class TestReportCommandObjects:
     """Verify command objects used by execution client report methods.
@@ -266,3 +285,632 @@ class TestReportCommandObjects:
             ts_init=1_000_000_000,
         )
         assert cmd.instrument_id is None
+
+
+# NOTE: upstream 9c7a430's reconnect catch-up tests were NOT adopted
+# here — our stream-fill hardening (TS_STREAM_FILL_HARDENING + the 30s
+# status reconcile poll) covers the missed-fill window continuously; upstream's
+# approach may be evaluated separately.
+
+
+# =============================================================================
+# _modify_order: 4xx vs 5xx error handling
+# =============================================================================
+
+def _make_modify_command(
+    client_order_id: str = "O-001",
+    ts_order_id: str = "TS-001",
+) -> ModifyOrder:
+    return ModifyOrder(
+        TraderId("TRADER-001"),
+        StrategyId("S-001"),
+        InstrumentId(Symbol("GCJ26"), Venue("TRADESTATION")),
+        ClientOrderId(client_order_id),
+        VenueOrderId(ts_order_id),
+        Quantity.from_int(1),
+        Price(3350.0, 1),
+        None,   # trigger_price
+        UUID4(),
+        0,      # ts_init
+    )
+
+
+def _make_exec_mock(command: ModifyOrder, ts_order_id: str = "TS-001") -> MagicMock:
+    """Minimal mock that passes _modify_order's pre-checks and cache lookup."""
+    m = MagicMock()
+    m._client_order_id_to_ts_order_id = {command.client_order_id: ts_order_id}
+    order = MagicMock()
+    order.quantity = Quantity.from_int(1)
+    m._cache = MagicMock()
+    m._cache.order.return_value = order
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    m._account_id = "SIM001"
+    return m
+
+
+class TestModifyOrderErrorHandling:
+    """_modify_order emits generate_order_modify_rejected on 4xx only."""
+
+    @pytest.mark.asyncio
+    async def test_400_emits_modify_rejected(self):
+        """HTTP 400 from broker triggers generate_order_modify_rejected."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 400): Invalid Parameter")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+        _, kwargs = m.generate_order_modify_rejected.call_args
+        assert kwargs["client_order_id"] == cmd.client_order_id
+        assert "400" in kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_422_emits_modify_rejected(self):
+        """HTTP 422 (order not modifiable) also triggers the rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 422): Order not modifiable")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_5xx_does_not_emit_modify_rejected(self):
+        """HTTP 5xx is ambiguous — modify may have succeeded, so no rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_error_does_not_emit_modify_rejected(self):
+        """A generic network error is also ambiguous — no rejection event."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Connection timeout")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_success_emits_order_updated_not_rejected(self):
+        """On success generate_order_updated is called and rejected is not."""
+        cmd = _make_modify_command()
+        m = _make_exec_mock(cmd)
+        m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-001"})
+        m._ts_order_id_to_client_order_id = {}
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_updated.assert_called_once()
+        m.generate_order_modify_rejected.assert_not_called()
+
+
+# =============================================================================
+# _update_account_state: retry and graceful degradation
+# =============================================================================
+
+def _make_account_state_mock() -> MagicMock:
+    m = MagicMock()
+    m._account_id = "SIM001"
+    m._account_id_nautilus = AccountId("TRADESTATION-SIM001")
+    m.account_id = AccountId("TRADESTATION-SIM001")
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    return m
+
+
+_BALANCES_OK = {"CashBalance": "50000", "Equity": "55000", "MarketValue": "5000"}
+
+
+class TestUpdateAccountState:
+    """_update_account_state retries on failure and never raises."""
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self, monkeypatch):
+        """Happy path: account state fetched and generate_account_state called."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(return_value=_BALANCES_OK)
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transient_error_then_succeeds(self, monkeypatch):
+        """First attempt fails, second succeeds — generate_account_state called once."""
+        sleep_calls = []
+        async def mock_sleep(s): sleep_calls.append(s)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(
+            side_effect=[Exception("HTTP 500"), _BALANCES_OK]
+        )
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+        assert len(sleep_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_retries_exhausted_does_not_raise(self, monkeypatch):
+        """Three consecutive failures log a warning but do not raise."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)  # must not raise
+        m.generate_account_state.assert_not_called()
+        assert m._log.warning.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_logs_trading_continues_message(self, monkeypatch):
+        """Final warning message tells operator trading continues."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)
+
+        warning_messages = " ".join(
+            str(call) for call in m._log.warning.call_args_list
+        )
+        assert "Trading will continue" in warning_messages
+
+
+# =============================================================================
+# _cancel_all_orders: instrument/strategy-scoped cancellation
+# =============================================================================
+
+from nautilus_trader.execution.messages import CancelAllOrders
+from nautilus_trader.model.enums import OrderSide
+
+
+def _make_cancel_all_command(
+    instrument_str: str = "GCJ26.TRADESTATION",
+    strategy_str: str = "S-001",
+    order_side: OrderSide = OrderSide.NO_ORDER_SIDE,
+) -> CancelAllOrders:
+    return CancelAllOrders(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId(strategy_str),
+        instrument_id=InstrumentId.from_str(instrument_str),
+        order_side=order_side,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _make_mock_order(
+    client_order_id: str,
+    venue_order_id: str,
+    side: OrderSide = OrderSide.BUY,
+    status: OrderStatus = OrderStatus.ACCEPTED,
+):
+    order = MagicMock()
+    order.client_order_id = ClientOrderId(client_order_id)
+    order.venue_order_id = VenueOrderId(venue_order_id)
+    order.side = side
+    order.status = status
+    return order
+
+
+def _make_cancel_all_exec_mock(
+    open_orders=None,
+    inflight_orders=None,
+):
+    m = MagicMock()
+    m._cache = MagicMock()
+    m._cache.orders_open.return_value = open_orders or []
+    m._cache.orders_inflight.return_value = inflight_orders or []
+    m._client = MagicMock()
+    m._client.cancel_order = AsyncMock()
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    m.generate_order_canceled = MagicMock()
+    m._check_order_statuses = AsyncMock()
+    return m
+
+
+class TestCancelAllOrdersFiltering:
+    """_cancel_all_orders must only cancel orders for the specified
+    instrument and strategy, never touching other strategies' orders."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_only_matching_orders(self):
+        """Only orders returned by cache for this instrument+strategy get canceled."""
+        gc_order = _make_mock_order("O-GC-1", "TS-100", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[gc_order])
+
+        cmd = _make_cancel_all_command("GCJ26.TRADESTATION", "S-001")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._cache.orders_open.assert_called_once_with(
+            instrument_id=cmd.instrument_id,
+            strategy_id=cmd.strategy_id,
+            side=cmd.order_side,
+        )
+        m._client.cancel_order.assert_called_once_with(order_id="TS-100")
+        m.generate_order_canceled.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_orders_skips_cancel(self):
+        """When cache returns no orders, no TS API calls are made."""
+        m = _make_cancel_all_exec_mock(open_orders=[])
+
+        cmd = _make_cancel_all_command("NQU26.TRADESTATION", "S-002")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_orders_all_canceled(self):
+        """All orders for the instrument+strategy are canceled."""
+        stop = _make_mock_order("O-1", "TS-200", OrderSide.SELL)
+        target = _make_mock_order("O-2", "TS-201", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[stop, target])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        assert m._client.cancel_order.call_count == 2
+        assert m.generate_order_canceled.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inflight_submitted_orders_included(self):
+        """Inflight orders with SUBMITTED status are also canceled."""
+        inflight = _make_mock_order(
+            "O-INF", "TS-300", OrderSide.BUY, OrderStatus.SUBMITTED,
+        )
+        m = _make_cancel_all_exec_mock(inflight_orders=[inflight])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-300")
+
+    @pytest.mark.asyncio
+    async def test_not_an_open_order_is_warning_not_error(self):
+        """Broker 'Not an open order' is logged as warning, not error."""
+        order = _make_mock_order("O-1", "TS-400")
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+        m._client.cancel_order = AsyncMock(
+            side_effect=Exception("Not an open order"),
+        )
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._log.warning.assert_called()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_order_without_venue_id_skipped(self):
+        """Orders with no venue_order_id (not yet acknowledged) are skipped."""
+        order = _make_mock_order("O-1", "TS-500")
+        order.venue_order_id = None
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m._log.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_side_filter_applied(self):
+        """When command specifies a side, only that side is canceled."""
+        buy = _make_mock_order("O-BUY", "TS-600", OrderSide.BUY)
+        sell = _make_mock_order("O-SELL", "TS-601", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[buy, sell])
+
+        cmd = _make_cancel_all_command(order_side=OrderSide.SELL)
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-601")
+
+    @pytest.mark.asyncio
+    async def test_venue_confirmed_cancels_suppresses_synthetic_cancel(self, monkeypatch):
+        """With TS_VENUE_CONFIRMED_CANCELS=1 the DELETE 200 is only a
+        request ack: cancel_order is sent but no synthetic OrderCanceled is
+        generated — the terminal event must come from the venue (the concurrent-fill race)."""
+        monkeypatch.setenv("TS_VENUE_CONFIRMED_CANCELS", "1")
+        order = _make_mock_order("O-1", "TS-700", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-700")
+        m.generate_order_canceled.assert_not_called()
+
+
+# =============================================================================
+# _cancel_order: concurrent fill recovery
+# =============================================================================
+
+class TestCancelOrderConcurrentFill:
+    """When broker returns 'Not an open order', _cancel_order must call
+    _check_order_statuses immediately so any concurrent fill is processed
+    before NT's ExecEngine times out and auto-generates OrderCanceled."""
+
+    def _make_cancel_order_mock(self, ts_order_id: str):
+        from nautilus_trader.model.identifiers import (
+            ClientOrderId,
+            InstrumentId,
+            Symbol,
+            Venue,
+        )
+        from nautilus_trader.model.identifiers import StrategyId, TraderId
+        from nautilus_trader.execution.messages import CancelOrder
+
+        m = MagicMock()
+        m._log = MagicMock()
+        m._client = MagicMock()
+        m._client_order_id_to_ts_order_id = {
+            ClientOrderId("O-EC-1"): ts_order_id,
+        }
+        m._check_order_statuses = AsyncMock()
+        m.generate_order_canceled = MagicMock()
+
+        cmd = CancelOrder(
+            trader_id=TraderId("TRADER-001"),
+            strategy_id=StrategyId("S-001"),
+            instrument_id=InstrumentId(Symbol("ECM26"), Venue("TRADESTATION")),
+            client_order_id=ClientOrderId("O-EC-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+        return m, cmd
+
+    @pytest.mark.asyncio
+    async def test_check_order_statuses_called_on_concurrent_fill(self):
+        """_check_order_statuses fires immediately when cancel returns 'Not an open order'
+        so any concurrent fill is processed before NT's ExecEngine auto-cancels."""
+        m, cmd = self._make_cancel_order_mock("TS-100000004")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Not an open order"))
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m._log.warning.assert_called()
+        m.generate_order_canceled.assert_not_called()
+        m._check_order_statuses.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_check_order_statuses_not_called_on_other_error(self):
+        """Other cancel errors log as error and do not trigger _check_order_statuses."""
+        m, cmd = self._make_cancel_order_mock("TS-100000004")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Connection refused"))
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m._log.error.assert_called()
+        m._check_order_statuses.assert_not_called()
+
+
+# =============================================================================
+# Shared-account reconciliation scoping: scope_reconciliation_to_known_orders
+# =============================================================================
+#
+# Shared-account reconciliation scoping: when several independent Nautilus
+# processes share one TradeStation account, get_orders()/get_positions()
+# return the WHOLE account, not this process's own orders/positions. On a cold
+# Nautilus cache, other processes' fills would be replayed into this node's
+# own belief, producing a net position that could disagree with the account's
+# actual net and trigger Nautilus's cross-zero auto-heal before any strategy
+# started.
+# These tests call the REAL, production generate_order_status_reports /
+# generate_fill_reports / generate_position_status_reports methods (bound to a
+# mock collaborator set, following this file's existing _make_exec_mock
+# pattern) rather than a reimplementation, so a regression here is a
+# regression in the exact code Nautilus's reconciliation calls.
+
+
+def _foreign_order(order_id, symbol="NQU26", side="Buy"):
+    """A fully-filled order this client never submitted (another strategy's fill)."""
+    return {
+        "OrderID": order_id,
+        "Status": "FLL",
+        "AccountID": "SIM_FUTURES",
+        "Symbol": "",
+        "Legs": [
+            {
+                "Symbol": symbol,
+                "AssetType": "FUTURE",
+                "BuyOrSell": side,
+                "QuantityOrdered": "1",
+                "ExecQuantity": "1",
+                "ExecutionPrice": "20500.0",
+            }
+        ],
+        "OrderType": "Market",
+        "TradeAction": side,
+        "TimeInForce": {"Duration": "DAY"},
+        "Quantity": "1",
+        "FilledQuantity": "1",
+        "AveragePrice": "20500.0",
+        "UnfilledQuantity": "0",
+        "OpenedDateTime": "2026-01-05T20:00:00Z",
+        "ClosedDateTime": "2026-01-05T20:00:01Z",
+    }
+
+
+def _account_net_position(symbol="NQU26", quantity="-2"):
+    return {
+        "AccountID": "SIM_FUTURES",
+        "Symbol": symbol,
+        "Quantity": quantity,
+        "AveragePrice": "20500.0",
+        "MarketValue": "0.0",
+        "UnrealizedProfitLoss": "0.0",
+        "AssetType": "FUTURE",
+    }
+
+
+def _make_reports_mock(*, scoped):
+    """Mock collaborator set for generate_*_report(s), real methods bound in."""
+    m = MagicMock()
+    m._scope_reconciliation_to_known_orders = scoped
+    m._ts_order_id_to_client_order_id = {}
+    m._account_id = "SIM_FUTURES"
+    m._account_id_nautilus = AccountId("TRADESTATION-SIM_FUTURES")
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = _TS_NOW
+    m._log = MagicMock()
+    m._cache = MagicMock()
+    m._cache.order.return_value = None
+    # Bind the REAL instance methods these production paths call internally.
+    m._parse_order_status_report = (
+        TradeStationExecutionClient._parse_order_status_report.__get__(
+            m, TradeStationExecutionClient
+        )
+    )
+    m._parse_order_status = TradeStationExecutionClient._parse_order_status.__get__(
+        m, TradeStationExecutionClient
+    )
+    return m
+
+
+class TestHostScopedReconciliation:
+    """scope_reconciliation_to_known_orders=True must never surface another
+    process's orders/fills/positions on a shared TradeStation account."""
+
+    @pytest.mark.asyncio
+    async def test_unscoped_default_replays_foreign_fills_unchanged(self):
+        """FAIL-BEFORE baseline: default (False) behavior is untouched -- every
+        foreign order still comes back tagged TS-{id}, reproducing the
+        multi-fill replay exactly as before this fix (regression guard
+        on the single-tenant / default topology, which must NOT change)."""
+        m = _make_reports_mock(scoped=False)
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[_foreign_order(f"10001{i:04d}") for i in range(7)]
+        )
+        cmd = GenerateOrderStatusReports(
+            instrument_id=None, start=None, end=None, open_only=False,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_order_status_reports(m, cmd)
+        assert len(reports) == 7
+        assert all(str(r.client_order_id).startswith("TS-") for r in reports)
+
+    @pytest.mark.asyncio
+    async def test_scoped_drops_foreign_orders(self):
+        """PASS-AFTER: scoped=True recognizes none of the foreign orders as
+        its own and returns zero reports -- the execution engine never
+        accumulates a net position derived from fills it did not place."""
+        m = _make_reports_mock(scoped=True)
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[_foreign_order(f"10001{i:04d}") for i in range(7)]
+        )
+        cmd = GenerateOrderStatusReports(
+            instrument_id=None, start=None, end=None, open_only=False,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_order_status_reports(m, cmd)
+        assert reports == []
+
+    @pytest.mark.asyncio
+    async def test_scoped_still_surfaces_this_hosts_own_known_order(self):
+        """A host whose own strategy has a real open lot: an order this client
+        itself submitted this session (present in
+        _ts_order_id_to_client_order_id) is still reported even when scoped --
+        scoping drops UNKNOWN orders only, never this client's own."""
+        m = _make_reports_mock(scoped=True)
+        own_coid = ClientOrderId("O-EXAMPLE-FUTS-STRATEGY-1")
+        m._ts_order_id_to_client_order_id = {"100000005": own_coid}
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[_foreign_order(f"10001{i:04d}") for i in range(7)]
+            + [_foreign_order("100000005")]
+        )
+        cmd = GenerateOrderStatusReports(
+            instrument_id=None, start=None, end=None, open_only=False,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_order_status_reports(m, cmd)
+        assert len(reports) == 1
+        assert reports[0].client_order_id == own_coid
+
+    @pytest.mark.asyncio
+    async def test_unscoped_fill_reports_include_foreign_fills(self):
+        """FAIL-BEFORE baseline for generate_fill_reports: default behavior
+        untouched, foreign fills still come back (coid=None)."""
+        m = _make_reports_mock(scoped=False)
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[_foreign_order(f"10001{i:04d}") for i in range(7)]
+        )
+        cmd = GenerateFillReports(
+            instrument_id=None, venue_order_id=None, start=None, end=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_fill_reports(m, cmd)
+        assert len(reports) == 7
+
+    @pytest.mark.asyncio
+    async def test_scoped_fill_reports_drop_foreign_fills(self):
+        """PASS-AFTER: generate_fill_reports drops every fill this client
+        cannot attribute to one of its own orders."""
+        m = _make_reports_mock(scoped=True)
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[_foreign_order(f"10001{i:04d}") for i in range(7)]
+        )
+        cmd = GenerateFillReports(
+            instrument_id=None, venue_order_id=None, start=None, end=None,
+            command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_fill_reports(m, cmd)
+        assert reports == []
+
+    @pytest.mark.asyncio
+    async def test_unscoped_position_reports_include_account_wide_net(self):
+        """FAIL-BEFORE baseline for generate_position_status_reports: default
+        behavior untouched -- the account's real net (mixing every strategy's
+        exposure) is still reported."""
+        m = _make_reports_mock(scoped=False)
+        m._client = MagicMock()
+        m._client.get_positions = AsyncMock(
+            return_value=[_account_net_position(quantity="-2")]
+        )
+        cmd = GeneratePositionStatusReports(
+            instrument_id=None, start=None, end=None, command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_position_status_reports(m, cmd)
+        assert len(reports) == 1
+        assert reports[0].quantity == Quantity.from_str("2")
+
+    @pytest.mark.asyncio
+    async def test_scoped_position_reports_always_empty(self):
+        """PASS-AFTER: scoped=True never reports a position at all -- the
+        account-wide net cannot be attributed to this host's strategies, so the host application's
+        own historical-position policy and position adoption remain the sole
+        authority instead of Nautilus's cross-zero auto-heal colliding with
+        it. This must hold even when the account genuinely holds a nonzero
+        net (a nonzero account net vs. fills replayed from other
+        processes must not collide)."""
+        m = _make_reports_mock(scoped=True)
+        m._client = MagicMock()
+        m._client.get_positions = AsyncMock(
+            return_value=[_account_net_position(quantity="-2")]
+        )
+        cmd = GeneratePositionStatusReports(
+            instrument_id=None, start=None, end=None, command_id=UUID4(), ts_init=0,
+        )
+        reports = await TradeStationExecutionClient.generate_position_status_reports(m, cmd)
+        assert reports == []
+        m._client.get_positions.assert_not_called()

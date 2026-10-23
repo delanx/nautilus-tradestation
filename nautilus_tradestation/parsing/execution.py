@@ -2,6 +2,7 @@
 Parsing functions for TradeStation execution reports and order conversion.
 """
 import logging
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -11,7 +12,7 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce
+from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLimitOrder, StopMarketOrder
@@ -52,6 +53,64 @@ def convert_time_in_force(tif: TimeInForce) -> str:
         TimeInForce.FOK: "FOK",
     }
     return _MAP.get(tif, "DAY")
+
+
+def intent_from_tags(order: Order) -> str | None:
+    """Return the TS_INTENT tag value from an order's tags, if present.
+
+    Submitting strategies tag orders with their intent (e.g.
+    ``TS_INTENT:close_short``) so the adapter can choose the correct
+    TradeStation TradeAction without inferring from cached position state
+    (the cache can be wrong).
+
+    Parameters
+    ----------
+    order : Order
+        The order whose tags to inspect.
+
+    Returns
+    -------
+    str | None
+        The intent value (e.g. ``"close_short"``), or ``None`` when no
+        ``TS_INTENT:`` tag is present.
+    """
+    for tag in order.tags or []:
+        tag_str = str(tag)
+        if tag_str.startswith("TS_INTENT:"):
+            return tag_str.split(":", 1)[1]
+    return None
+
+
+def equity_trade_action_from_intent(order: Order) -> str | None:
+    """Map an EQUITY order's TS_INTENT tag to a TradeStation TradeAction.
+
+    TradeStation requires ``BuyToCover`` to close an equity short and plain
+    ``Sell`` to close an equity long. Futures must NOT use this mapping —
+    TradeStation rejects SellShort/BuyToCover on futures.
+
+    Parameters
+    ----------
+    order : Order
+        The equity order whose intent tag to map.
+
+    Returns
+    -------
+    str | None
+        ``"SellShort"`` for a tagged short-open SELL, ``"BuyToCover"`` for a
+        tagged short-cover BUY, ``"Sell"`` for a tagged long-close SELL,
+        ``"Buy"`` for a tagged long-open BUY, or ``None`` when no intent tag
+        applies (caller keeps its default Buy/Sell action).
+    """
+    intent = intent_from_tags(order)
+    if intent == "open_short" and order.side == OrderSide.SELL:
+        return "SellShort"
+    if intent == "open_long" and order.side == OrderSide.BUY:
+        return "Buy"
+    if intent == "close_short" and order.side == OrderSide.BUY:
+        return "BuyToCover"
+    if intent == "close_long" and order.side == OrderSide.SELL:
+        return "Sell"
+    return None
 
 
 def convert_order_to_ts_format(order: Order, account_id: str) -> dict[str, Any]:
@@ -120,12 +179,78 @@ def parse_ts_order_type(ts_order_type: str) -> OrderType:
     return _MAP.get(ts_order_type, OrderType.MARKET)
 
 
+def _decimal_or_zero(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001 -- any unparseable quantity counts as absent
+        return Decimal(0)
+
+
+def resolve_order_quantities(ts_order: dict) -> tuple[Decimal, Decimal]:
+    """Resolve ``(ordered, filled)`` quantities from a raw TS order payload.
+
+    TradeStation does not always populate the top-level ``Quantity`` /
+    ``FilledQuantity`` fields: several payload shapes (notably futures order
+    statuses) carry quantities only inside ``Legs`` — the same schema quirk as
+    the Legs-only ``Symbol`` handled during reconciliation.  Before this
+    helper, a payload without a top-level ``Quantity`` flowed ``0`` into the
+    ``OrderStatusReport`` constructor, which raises ``'quantity' not a
+    positive real`` — caught broadly, so the whole status report was silently
+    DROPPED.  A dropped
+    status report can desync engine state from broker state.
+
+    Fallback order (first non-zero wins):
+      ordered: top-level ``Quantity`` -> ``Legs[0].QuantityOrdered`` -> filled
+      filled:  top-level ``FilledQuantity`` -> ``Legs[0].ExecQuantity``
+
+    Multi-leg group orders report leg 0, consistent with every other Legs
+    fallback in this adapter (symbol, execution price).
+    """
+    ordered = _decimal_or_zero(ts_order.get("Quantity") or "0")
+    filled = _decimal_or_zero(ts_order.get("FilledQuantity") or "0")
+    legs = ts_order.get("Legs") or []
+    if ordered == 0 and legs:
+        ordered = _decimal_or_zero(legs[0].get("QuantityOrdered") or "0")
+    if filled == 0 and legs:
+        filled = _decimal_or_zero(legs[0].get("ExecQuantity") or "0")
+    if filled > ordered:
+        # A fill proves at least that much was ordered.
+        ordered = filled
+    return ordered, filled
+
+
+def resolve_trigger_price(ts_order: dict) -> str | None:
+    """Resolve a stop order's trigger price from a raw TS order payload.
+
+    TradeStation carries the stop trigger as top-level ``StopPrice`` —
+    confirmed against live SIM captures of both ``/orders`` and
+    ``/historicalorders`` (every StopMarket
+    payload, open or terminal, had top-level ``StopPrice``).  Defensively we
+    also accept ``TriggerPrice`` (alternate spelling) and ``Legs[*].StopPrice``
+    (the same Legs-only schema quirk as Symbol/Quantity/ExecutionPrice).
+    Zero, empty, and unparseable values count as absent.
+    """
+    candidates: list[Any] = [ts_order.get("StopPrice"), ts_order.get("TriggerPrice")]
+    for leg in ts_order.get("Legs") or []:
+        candidates.append(leg.get("StopPrice"))
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        try:
+            if float(value) != 0.0:
+                return str(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def parse_order_status_report(
     ts_order: dict,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     account_id: AccountId,
     ts_now: int,
+    fallback_quantity: Decimal | None = None,
 ) -> OrderStatusReport | None:
     """Parse a raw TradeStation order dict into an OrderStatusReport.
 
@@ -141,18 +266,37 @@ def parse_order_status_report(
         The NautilusTrader account ID.
     ts_now : int
         Current timestamp in nanoseconds (from clock).
+    fallback_quantity : Decimal, optional
+        Ordered quantity to use when the payload itself carries none anywhere
+        (no top-level ``Quantity``, no ``Legs`` quantity, no fill) — callers
+        with a cached engine order pass its quantity so the report survives
+        instead of being dropped.
 
     Returns
     -------
     OrderStatusReport or None
-        Parsed report, or None if parsing fails.
+        Parsed report, or None if parsing fails or no positive ordered
+        quantity can be resolved from payload + fallback (logged loudly —
+        never a silent exception-driven drop).
     """
     try:
         ts_order_id = ts_order.get("OrderID")
         status = parse_order_status(ts_order.get("Status", ""))
 
-        qty_ordered = Decimal(ts_order.get("Quantity") or "0")
-        qty_filled = Decimal(ts_order.get("FilledQuantity") or "0")
+        qty_ordered, qty_filled = resolve_order_quantities(ts_order)
+        if qty_ordered == 0 and fallback_quantity is not None and fallback_quantity > 0:
+            qty_ordered = fallback_quantity
+        if qty_ordered == 0:
+            # Classified drop, not an exception: OrderStatusReport requires a
+            # positive quantity, and this payload offers none anywhere.
+            _log.warning(
+                "Zero-quantity order status report dropped: "
+                "OrderID=%s Status=%s has no Quantity, no Legs quantity, no fill "
+                "and no cached-order fallback",
+                ts_order_id,
+                ts_order.get("Status"),
+            )
+            return None
 
         price_str = ts_order.get("LimitPrice") or ts_order.get("Price") or "0"
         price = Price.from_str(price_str) if price_str != "0" else None
@@ -163,16 +307,52 @@ def parse_order_status_report(
         avg_px_str = ts_order.get("AveragePrice") or "0"
         avg_px = Price.from_str(avg_px_str) if avg_px_str != "0" else None
 
+        order_type = parse_ts_order_type(ts_order.get("OrderType", "Market"))
+
+        # A stop-type report MUST carry trigger_price: during startup
+        # reconciliation the engine materializes EXTERNAL reports via
+        # OrderUnpacker -> StopMarketOrder.create_c, which does
+        # options['trigger_price'] and raises KeyError when absent — killing
+        # the whole client.
+        trigger_price: Price | None = None
+        trigger_type = TriggerType.NO_TRIGGER
+        if order_type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT):
+            trigger_str = resolve_trigger_price(ts_order)
+            if trigger_str is None:
+                # Classified drop, not an exception, and NEVER a fabricated
+                # price: skipping this single (almost certainly EXTERNAL)
+                # report is the safest degrade — engine state for one venue
+                # order goes un-reconciled this pass; the node survives.
+                _log.error(
+                    "Stop-type order status report SKIPPED: "
+                    "OrderID=%s OrderType=%s Status=%s carries no usable "
+                    "StopPrice/TriggerPrice anywhere in the payload; emitting "
+                    "it without trigger_price would crash live reconciliation "
+                    "(KeyError 'trigger_price' in OrderUnpacker). Review this "
+                    "venue order manually.",
+                    ts_order_id,
+                    ts_order.get("OrderType"),
+                    ts_order.get("Status"),
+                )
+                return None
+            trigger_price = Price.from_str(trigger_str)
+            # OrderStatusReport requires a non-NO_TRIGGER trigger_type when
+            # trigger_price is set, and StopMarketOrder.create_c rejects
+            # NO_TRIGGER — DEFAULT means the venue's standard trigger method.
+            trigger_type = TriggerType.DEFAULT
+
         return OrderStatusReport(
             account_id=account_id,
             instrument_id=instrument_id,
             client_order_id=client_order_id,
             venue_order_id=VenueOrderId(ts_order_id) if ts_order_id else None,
             order_side=side,
-            order_type=parse_ts_order_type(ts_order.get("OrderType", "Market")),
+            order_type=order_type,
             time_in_force=TimeInForce.DAY,
             order_status=status,
             price=price,
+            trigger_price=trigger_price,
+            trigger_type=trigger_type,
             quantity=Quantity.from_str(str(qty_ordered)),
             filled_qty=Quantity.from_str(str(qty_filled)),
             avg_px=avg_px,
@@ -301,6 +481,7 @@ def _group_type_for_order_list(orders: list[Order]) -> str | None:
 def convert_order_list_to_ts_group(
     orders: list[Order],
     account_id: str,
+    is_equity: Callable[[Order], bool] | None = None,
 ) -> tuple[str, list[dict]] | None:
     """Convert an NT OrderList into a TradeStation group order payload.
 
@@ -310,6 +491,12 @@ def convert_order_list_to_ts_group(
         The orders from the OrderList (must be 2+ orders with contingencies).
     account_id : str
         The TradeStation account ID.
+    is_equity : Callable[[Order], bool], optional
+        Predicate returning ``True`` when an order's instrument is an equity.
+        When provided, equity legs honor ``TS_INTENT`` tags so short-cover
+        legs go out as ``BuyToCover`` instead of plain ``Buy`` (the equity short-cover
+        rejection class). When ``None`` (default) payloads are
+        byte-identical to the previous behavior.
 
     Returns
     -------
@@ -334,6 +521,13 @@ def convert_order_list_to_ts_group(
             "TradeAction": params["trade_action"],
             "TimeInForce": {"Duration": params["time_in_force"]},
         }
+        # Equity legs honor TS_INTENT tags (equity short-cover rejection class):
+        # without this an equity short-cover leg goes out plain 'Buy' and
+        # is rejected by TradeStation. Futures keep plain Buy/Sell.
+        if is_equity is not None and is_equity(order):
+            intent_action = equity_trade_action_from_intent(order)
+            if intent_action is not None:
+                payload["TradeAction"] = intent_action
         if "limit_price" in params:
             payload["LimitPrice"] = params["limit_price"]
         if "stop_price" in params:

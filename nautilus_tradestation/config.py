@@ -45,13 +45,15 @@ class TradeStationDataClientConfig(LiveDataClientConfig, frozen=True):
     use_sandbox: bool = False
     account_id: str | None = None
     base_url_http: str | None = None
+    allow_custom_base_url: bool = False  # Skip hostname validation on base_url_http
     recv_window_ms: int = 5000
     max_retries: int | None = None
     retry_delay_initial_ms: int = 1000
     retry_delay_max_ms: int = 60000
     instrument_ids: tuple[str, ...] = ()  # Pre-load these instruments during _connect()
-    use_streaming: bool = False  # If True, use SSE streaming for quotes/ticks instead of polling
+    use_streaming: bool = True  # Use SSE streaming for bars (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay (doubles on failure)
+    extended_hours: bool = False  # If True, use USEQPreAndPost session template for equity bar streams
 
 
 class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
@@ -95,10 +97,32 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     refresh_token: str | None = None
     use_sandbox: bool = False
     base_url_http: str | None = None
+    allow_custom_base_url: bool = False  # Skip hostname validation on base_url_http
     base_url_ws: str | None = None
     recv_window_ms: int = 5000
     max_retries: int | None = None
     retry_delay_initial_ms: int = 1000
     retry_delay_max_ms: int = 60000
-    use_streaming: bool = False  # If True, use SSE order stream instead of polling fills
+    use_streaming: bool = True  # Use SSE order stream for fill notifications (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay
+    extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)
+    order_map_path: str | None = None  # Path to persist order-ID map across restarts
+    scope_reconciliation_to_known_orders: bool = False
+    """
+    If True, ``generate_order_status_reports``/``generate_fill_reports`` return ONLY
+    orders this client itself has submitted or loaded from ``order_map_path`` (never a
+    synthetic ``TS-{order_id}`` catch-all for an order it does not recognize), and
+    ``generate_position_status_reports`` always returns an empty list.
+
+    Set this True when multiple independent Nautilus nodes/strategies trade the SAME
+    broker account (a shared-account, many-strategies-per-account topology): TradeStation's
+    ``get_orders``/``get_positions`` return the WHOLE account, with no per-process or
+    per-strategy field to distinguish "my order" from "another process's order" (TS never
+    echoes back a client-supplied reference at all). Left False (the default), a cold
+    Nautilus cache would replay every OTHER process's fills on this account as if they were
+    its own, and reconcile a net position that can disagree in sign with the
+    account's actual net (Nautilus's cross-zero auto-heal can then abort the node before any
+    strategy starts). Leave False for a
+    single-tenant account, where the account-wide view IS this process's own view and the
+    normal reconciliation behavior is wanted.
+    """

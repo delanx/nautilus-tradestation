@@ -187,6 +187,315 @@ class TestParsingExecutionModule:
         # Either None or a minimal report is acceptable; must not raise
         assert report is None or report is not None
 
+    # -- zero/Legs-only quantity handling --------------------------------------
+    # Payloads without a top-level Quantity used to flow 0 into
+    # OrderStatusReport, which raises "'quantity' not a positive real"; a
+    # broad except then silently dropped the report.
+
+    def test_parse_order_status_report_legs_only_quantity(self):
+        """Futures-shaped payload: quantity lives ONLY in Legs (like Symbol)."""
+        payload = {
+            "OrderID": "TS-ORDER-LEGS",
+            "Status": "CAN",
+            "Legs": [{
+                "Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Buy",
+                "QuantityOrdered": "2", "ExecQuantity": "0", "ExecutionPrice": "0",
+            }],
+            "OrderType": "Limit",
+            "LimitPrice": "6000.0",
+            "TradeAction": "Buy",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-LEGS"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None  # was dropped before the Legs-quantity fallback
+        assert report.order_status == OrderStatus.CANCELED
+        assert float(report.quantity) == 2.0
+        assert float(report.filled_qty) == 0.0
+
+    def test_parse_order_status_report_legs_only_partial_fill(self):
+        """Legs-only quantities including a partial fill (ExecQuantity)."""
+        payload = {
+            "OrderID": "TS-ORDER-FLP",
+            "Status": "FLP",
+            "Legs": [{
+                "Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Buy",
+                "QuantityOrdered": "3", "ExecQuantity": "1", "ExecutionPrice": "6000.0",
+            }],
+            "OrderType": "Market",
+            "TradeAction": "Buy",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-FLP"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None
+        assert report.order_status == OrderStatus.PARTIALLY_FILLED
+        assert float(report.quantity) == 3.0
+        assert float(report.filled_qty) == 1.0
+
+    def test_parse_order_status_report_zero_qty_uses_cached_fallback(self):
+        """No quantity anywhere in the payload -> cached order qty keeps the report."""
+        from decimal import Decimal
+        payload = {
+            "OrderID": "TS-ORDER-ZQ",
+            "Status": "OUT",
+            "OrderType": "Market",
+            "TradeAction": "Sell",
+        }
+        report = parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-ZQ"),
+            _ACCOUNT_ID, _TS_NOW,
+            fallback_quantity=Decimal("4"),
+        )
+        assert report is not None
+        assert report.order_status == OrderStatus.CANCELED
+        assert report.order_side == OrderSide.SELL
+        assert float(report.quantity) == 4.0
+
+    def test_parse_order_status_report_zero_qty_no_fallback_classified_drop(self):
+        """Genuinely quantity-less payload with no fallback: drops with a
+        classified warning (return None), never an exception-driven drop."""
+        import logging
+        payload = {
+            "OrderID": "TS-ORDER-ZQ2",
+            "Status": "OUT",
+            "OrderType": "Market",
+            "TradeAction": "Buy",
+        }
+        logger = logging.getLogger("nautilus_tradestation.parsing.execution")
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            report = parse_order_status_report(
+                payload,
+                InstrumentId.from_str("ESM26.TRADESTATION"),
+                ClientOrderId("O-ZQ2"),
+                _ACCOUNT_ID, _TS_NOW,
+            )
+        finally:
+            logger.removeHandler(handler)
+        assert report is None
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert warnings, "expected a classified zero-quantity warning"
+        assert "Zero-quantity" in warnings[0].getMessage()
+        # and NO 'Failed to parse' error (the old exception-driven path)
+        assert not any(r.levelno >= logging.ERROR for r in records)
+
+    def test_resolve_order_quantities_fill_proves_ordered(self):
+        """ordered < filled can't happen: a fill proves at least that much ordered."""
+        from nautilus_tradestation.parsing.execution import resolve_order_quantities
+        ordered, filled = resolve_order_quantities(
+            {"FilledQuantity": "2"},  # no Quantity, no Legs
+        )
+        assert ordered == 2 and filled == 2
+
+
+class TestStopReportTriggerPriceHardening:
+    """A stop-type OrderStatusReport must NEVER go out without
+    trigger_price.
+
+    Regression guard: the parser
+    never read ``StopPrice``, so every stop-type report had
+    ``trigger_price=None``.  During startup reconciliation the live engine
+    materializes EXTERNAL reports via ``OrderUnpacker.from_init`` ->
+    ``StopMarketOrder.create_c``, which does ``options['trigger_price']`` and
+    raised ``KeyError`` — which would abort the whole client on the first
+    terminal stop order in the day's order list.
+    """
+
+    def _parse(self, payload, coid="O-STOP"):
+        return parse_order_status_report(
+            payload,
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId(coid),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+
+    @staticmethod
+    def _venue_stop_payload(**overrides) -> dict:
+        """/orders payload shape for a StopMarket OCO leg with REJ status."""
+        payload = {
+            "OrderID": "100000001",
+            "Status": "REJ",
+            "StatusDescription": "Rejected",
+            "AccountID": "SIM0000001F",
+            "OrderType": "StopMarket",
+            "StopPrice": "5123.50",
+            "Duration": "GTC",
+            "GroupName": "OCO 100000003",
+            "AdvancedOptions": "STPTRG=STT;OCA=100000003;",
+            "ConditionalOrders": [{"Relationship": "OCO", "OrderID": "100000002"}],
+            "OpenedDateTime": "2026-01-05T15:00:00Z",
+            "ClosedDateTime": "2026-01-05T15:00:00Z",
+            "TradeAction": "Sell",
+            "Legs": [{
+                "Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Sell",
+                "QuantityOrdered": "1", "ExecQuantity": "0",
+                "QuantityRemaining": "0", "Underlying": "ES",
+            }],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_stop_market_report_carries_trigger_price(self):
+        """Primary parse: top-level StopPrice -> trigger_price + DEFAULT type."""
+        from nautilus_trader.model.enums import TriggerType
+        report = self._parse(self._venue_stop_payload())
+        assert report is not None
+        assert report.order_type == OrderType.STOP_MARKET
+        assert report.trigger_price is not None
+        assert float(report.trigger_price) == pytest.approx(5123.50, rel=1e-9)
+        assert report.trigger_type == TriggerType.DEFAULT
+
+    def test_stop_market_fixture_still_parses(self):
+        """The long-standing FLL stop fixture keeps working, now with trigger."""
+        report = parse_order_status_report(
+            TSTestOrderStubs.stop_order_filled(),
+            InstrumentId.from_str("ESM26.TRADESTATION"),
+            ClientOrderId("O-STOP-FLL"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None
+        assert report.order_type == OrderType.STOP_MARKET
+        assert float(report.trigger_price) == pytest.approx(5200.0, rel=1e-9)
+
+    def test_stop_trigger_from_alternate_field_name(self):
+        """TriggerPrice (alternate spelling) populates trigger_price."""
+        payload = self._venue_stop_payload()
+        del payload["StopPrice"]
+        payload["TriggerPrice"] = "5122.25"
+        report = self._parse(payload)
+        assert report is not None
+        assert float(report.trigger_price) == pytest.approx(5122.25, rel=1e-9)
+
+    def test_stop_trigger_from_legs_fallback(self):
+        """Legs-only StopPrice (the Symbol/Quantity schema quirk) is honored."""
+        payload = self._venue_stop_payload()
+        del payload["StopPrice"]
+        payload["Legs"][0]["StopPrice"] = "5120.00"
+        report = self._parse(payload)
+        assert report is not None
+        assert float(report.trigger_price) == pytest.approx(5120.00, rel=1e-9)
+
+    def test_stop_limit_carries_both_prices(self):
+        payload = self._venue_stop_payload(
+            OrderType="StopLimit", LimitPrice="5125.00",
+        )
+        report = self._parse(payload)
+        assert report is not None
+        assert report.order_type == OrderType.STOP_LIMIT
+        assert float(report.trigger_price) == pytest.approx(5123.50, rel=1e-9)
+        assert float(report.price) == pytest.approx(5125.00, rel=1e-9)
+
+    def test_stop_without_any_trigger_is_classified_skip_not_crash(self):
+        """Genuinely missing StopPrice: LOUD classified skip naming the venue
+        order ID — no fabricated price, no exception-driven drop."""
+        import logging
+        payload = self._venue_stop_payload()
+        del payload["StopPrice"]
+        logger = logging.getLogger("nautilus_tradestation.parsing.execution")
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            report = self._parse(payload)
+        finally:
+            logger.removeHandler(handler)
+        assert report is None
+        errors = [r for r in records if r.levelno == logging.ERROR]
+        assert errors, "expected a classified trigger-price error"
+        msg = errors[0].getMessage()
+        assert "trigger" in msg.lower()
+        assert "100000001" in msg  # the venue order ID must be named
+        assert not any("Failed to parse" in r.getMessage() for r in records)
+
+    def test_stop_with_zero_or_garbage_trigger_is_skipped(self):
+        """Zero/empty/unparseable StopPrice counts as absent -> skip."""
+        for bad in ("0", "", None, "abc"):
+            report = self._parse(self._venue_stop_payload(StopPrice=bad))
+            assert report is None, f"StopPrice={bad!r} must not produce a stop report"
+
+    def test_non_stop_orders_keep_no_trigger(self):
+        """Market/Limit reports are unchanged: no trigger_price attached."""
+        from nautilus_trader.model.enums import TriggerType
+        report = parse_order_status_report(
+            TSTestOrderStubs.limit_order_open(),
+            InstrumentId.from_str("GCJ26.TRADESTATION"),
+            ClientOrderId("O-LIM"),
+            _ACCOUNT_ID, _TS_NOW,
+        )
+        assert report is not None
+        assert report.trigger_price is None
+        assert report.trigger_type == TriggerType.NO_TRIGGER
+
+    def test_engine_external_order_roundtrip_no_keyerror(self):
+        """The engine's external-order path: engine _generate_order builds
+        OrderInitialized from the report and OrderUnpacker.from_init calls
+        StopMarketOrder.create_c (options['trigger_price']).  Before the fix
+        this raised KeyError 'trigger_price' and aborted the client."""
+        from nautilus_trader.core.uuid import UUID4
+        from nautilus_trader.model.enums import TriggerType, trigger_type_to_str
+        from nautilus_trader.model.events import OrderInitialized
+        from nautilus_trader.model.identifiers import StrategyId, TraderId
+        from nautilus_trader.model.orders import StopMarketOrder
+        from nautilus_trader.model.orders.unpacker import OrderUnpacker
+
+        report = self._parse(self._venue_stop_payload())
+        assert report is not None
+
+        # Mirror nautilus_trader.live.execution_engine._generate_order
+        options = {}
+        if report.price is not None:
+            options["price"] = str(report.price)
+        if report.trigger_price is not None:
+            options["trigger_price"] = str(report.trigger_price)
+        if report.trigger_type is not None:
+            options["trigger_type"] = trigger_type_to_str(report.trigger_type)
+        options["expire_time_ns"] = 0
+
+        initialized = OrderInitialized(
+            trader_id=TraderId("TESTER-001"),
+            strategy_id=StrategyId("EXTERNAL"),
+            instrument_id=report.instrument_id,
+            client_order_id=report.client_order_id,
+            order_side=report.order_side,
+            order_type=report.order_type,
+            quantity=report.quantity,
+            time_in_force=report.time_in_force,
+            post_only=report.post_only,
+            reduce_only=report.reduce_only,
+            quote_quantity=False,
+            options=options,
+            emulation_trigger=TriggerType.NO_TRIGGER,
+            trigger_instrument_id=None,
+            contingency_type=report.contingency_type,
+            order_list_id=report.order_list_id,
+            linked_order_ids=report.linked_order_ids,
+            parent_order_id=report.parent_order_id,
+            exec_algorithm_id=None,
+            exec_algorithm_params=None,
+            exec_spawn_id=None,
+            tags=["VENUE"],
+            event_id=UUID4(),
+            ts_init=_TS_NOW,
+            reconciliation=True,
+        )
+
+        order = OrderUnpacker.from_init(initialized)  # KeyError pre-fix
+        assert isinstance(order, StopMarketOrder)
+        assert float(order.trigger_price) == pytest.approx(5123.50, rel=1e-9)
+
     # -- convert_order_type --------------------------------------------------
 
     def test_convert_order_type_market(self):
@@ -332,6 +641,24 @@ class TestParsingInstrumentsModule:
         data = self._load("symbol_detail_equity.json")
         instrument = parse_instrument("AAPL", data, TRADESTATION_VENUE)
         assert isinstance(instrument, Equity)
+
+    def test_parse_index_is_data_only_index_instrument(self):
+        # Shape of a TS /marketdata/symbols/$NDX.X payload.
+        from nautilus_trader.model.instruments import IndexInstrument
+
+        data = {
+            "AssetType": "INDEX", "Currency": "USD", "Description": "Nasdaq 100",
+            "Exchange": "NASDQ", "Symbol": "$NDX.X", "Root": "$NDX.X",
+            "PriceFormat": {"Format": "Decimal", "Decimals": "2", "Increment": "0.01",
+                            "PointValue": "1"},
+            "QuantityFormat": {"Format": "Decimal", "Decimals": "0", "Increment": "1",
+                               "MinimumTradeQuantity": "1"},
+        }
+        instrument = parse_instrument("$NDX.X", data, TRADESTATION_VENUE)
+        assert isinstance(instrument, IndexInstrument)
+        assert str(instrument.id) == "$NDX.X.TRADESTATION"
+        assert instrument.id.symbol.value == "$NDX.X"
+        assert instrument.price_precision == 2
 
     def test_parse_unsupported_asset_type_returns_none(self):
         data = {"AssetType": "CRYPTO", "PriceFormat": {"Increment": "0.01"}, "QuantityFormat": {}}

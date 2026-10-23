@@ -2,8 +2,6 @@
 
 Community-contributed [TradeStation](https://www.tradestation.com/) adapter for [NautilusTrader](https://github.com/nautechsystems/nautilus_trader).
 
-Production-tested with 20+ concurrent futures strategies in paper trading.
-
 ## Features
 
 - **Market data:** Historical bars (REST), live bar subscriptions (HTTP polling or SSE streaming), quote ticks, trade ticks
@@ -88,6 +86,25 @@ export TRADESTATION_REFRESH_TOKEN="your_refresh_token"
 export TRADESTATION_ACCOUNT_ID="your_account_id"
 ```
 
+### Optional host hooks
+
+Applications that run many adapter processes against one TradeStation account
+can plug in their own monitoring. Both hooks are **off by default**; when unset
+(or when the named module cannot be imported) the adapter behaves exactly as a
+standalone install and imports nothing.
+
+| Variable | Format | What the adapter does with it |
+|----------|--------|-------------------------------|
+| `TRADESTATION_BUDGET_MODULE` | `pkg.module` | Imported once per process. Every REST call is reported via `record_call(*, url, method, status, headers, duration_ms, kind)`; the background order-status poll and the connect-time account calls ask `reserve(account_id, *, kind)` (returns an object with `.granted` / `.reason`) before calling; `set_default_account(account_id)` and `flush_if_due(account_id)` are also called. The module must define `KIND_POLL`, `KIND_STARTUP` and `KIND_CRITICAL`. Order submit / replace / cancel is recorded but never gated. Any error inside the module is ignored and the call proceeds (fail-open). |
+| `TRADESTATION_ORDER_FEED_HOOK` | `pkg.module:function` | Called as `function(account_id, proxy=<str or None>, degraded=<bool>)` whenever the execution client connects or its order feed degrades / recovers. If the module cannot be imported, nothing happens. If it imports but the function is missing or raises, a single `[ORDER-FEED-WARNING]` line is printed once per process; trading is never affected. |
+
+Example:
+
+```bash
+export TRADESTATION_BUDGET_MODULE="myapp.api_budget"
+export TRADESTATION_ORDER_FEED_HOOK="myapp.monitoring:set_order_feed_state"
+```
+
 ## Configuration Options
 
 ### Data Client
@@ -149,6 +166,29 @@ nautilus_tradestation/
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -q
+```
+
+## Order Idempotency
+
+`place_order()` and `place_order_group()` automatically inject an `OrderConfirmId` (max
+22 chars) into every POST. TradeStation uses this field to deduplicate — if the same
+confirm ID is received twice, the broker rejects the second submission without creating a
+duplicate order. This protects against duplicate fills on 5xx retries.
+
+You can supply your own ID via the optional kwarg:
+```python
+await client.place_order(..., order_confirm_id="my-unique-id-22chars")
+```
+If omitted, the adapter auto-generates a valid ID.
+
+**HTTP 200 does not mean success.** TradeStation returns 200 for rejected orders; the
+rejection is in the body (`Orders[0]["Error"] == "FAILED"`). The adapter raises:
+- `OrderRejectedException` — business rejection (insufficient margin, invalid symbol, etc.)
+- `DuplicateOrderConfirmIdException` — dedup-ack received but original order unfindable
+
+Both exceptions are exported from the top-level package:
+```python
+from tradestation_nt_community import OrderRejectedException, DuplicateOrderConfirmIdException
 ```
 
 ## Known Constraints

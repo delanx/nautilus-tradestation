@@ -1,6 +1,7 @@
 """
 Parsing functions for TradeStation market data (bars, quotes).
 """
+
 import logging
 
 import pandas as pd
@@ -8,12 +9,17 @@ import pandas as pd
 from nautilus_tradestation.common.enums import TradeStationBarUnit
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick, TradeTick
+from nautilus_trader.model.data import (
+    Bar,
+    BarSpecification,
+    BarType,
+    QuoteTick,
+    TradeTick,
+)
 from nautilus_trader.model.enums import AggressorSide, BarAggregation
 from nautilus_trader.model.identifiers import InstrumentId, TradeId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
-
 
 _log = logging.getLogger(__name__)
 
@@ -67,6 +73,11 @@ def parse_bars(raw_bars: list[dict], bar_type: BarType) -> list[Bar]:
             ts_str = raw_bar["TimeStamp"]
             ts = pd.Timestamp(ts_str, tz="UTC")
             ts_event = dt_to_unix_nanos(ts)
+            ts_init = int(
+                raw_bar.get("_ts_bar_emit_ns")
+                or raw_bar.get("_ts_sse_received_ns")
+                or ts_event
+            )
             bar = Bar(
                 bar_type=bar_type,
                 open=Price.from_str(str(raw_bar["Open"])),
@@ -75,7 +86,7 @@ def parse_bars(raw_bars: list[dict], bar_type: BarType) -> list[Bar]:
                 close=Price.from_str(str(raw_bar["Close"])),
                 volume=Quantity.from_str(str(raw_bar.get("TotalVolume", 0))),
                 ts_event=ts_event,
-                ts_init=ts_event,
+                ts_init=ts_init,
             )
             bars.append(bar)
         except Exception as e:

@@ -1,4 +1,4 @@
 [
-  {"AccountID": "SIM0000001F", "Symbol": "GCJ26", "Quantity": "1", "AveragePrice": "3350.0", "MarketValue": "335000.0", "UnrealizedProfitLoss": "500.0", "AssetType": "FUTURE"},
-  {"AccountID": "SIM0000001F", "Symbol": "ESM26", "Quantity": "-1", "AveragePrice": "5250.0", "MarketValue": "-262500.0", "UnrealizedProfitLoss": "-250.0", "AssetType": "FUTURE"}
+  {"AccountID": "SIM0000001F", "Symbol": "GCJ26", "Quantity": "2", "AveragePrice": "3000.0", "MarketValue": "600000.0", "UnrealizedProfitLoss": "1000.0", "AssetType": "FUTURE"},
+  {"AccountID": "SIM0000001F", "Symbol": "ESM26", "Quantity": "-2", "AveragePrice": "5000.0", "MarketValue": "-500000.0", "UnrealizedProfitLoss": "-500.0", "AssetType": "FUTURE"}
 ]

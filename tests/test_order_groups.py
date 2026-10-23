@@ -5,13 +5,22 @@ Tests the parsing helpers and HTTP client fixture.  The full _submit_order_list
 integration path requires a live NT node and is covered by the fallback path test.
 """
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nautilus_tradestation.http.client import (
+    DuplicateOrderConfirmIdException,
+    OrderRejectedException,
+    TradeStationHttpClient,
+)
 from nautilus_tradestation.parsing.execution import (
     _group_type_for_order_list,
     convert_order_list_to_ts_group,
+    equity_trade_action_from_intent,
+    intent_from_tags,
 )
 from nautilus_trader.model.enums import (
     ContingencyType,
@@ -42,7 +51,8 @@ def _uid():
 def _limit_order(coid: str, side: OrderSide, price: float,
                  contingency: ContingencyType = ContingencyType.OCO,
                  order_list_id: str = "OL-001",
-                 linked: list[str] | None = None):
+                 linked: list[str] | None = None,
+                 tags: list[str] | None = None):
     from nautilus_trader.model.orders import LimitOrder
     return LimitOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
@@ -56,32 +66,36 @@ def _limit_order(coid: str, side: OrderSide, price: float,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
 def _market_order(coid: str, side: OrderSide,
                   contingency: ContingencyType = ContingencyType.OTO,
                   order_list_id: str = "OL-001",
-                  linked: list[str] | None = None):
+                  linked: list[str] | None = None,
+                  tags: list[str] | None = None):
     from nautilus_trader.model.orders import MarketOrder
     return MarketOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
         instrument_id=_INSTRUMENT_ID,
         client_order_id=ClientOrderId(coid),
-        order_side=OrderSide.BUY,
+        order_side=side,
         quantity=Quantity.from_int(1),
         time_in_force=TimeInForce.DAY,
         init_id=_uid(), ts_init=0,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
 def _stop_order(coid: str, side: OrderSide, stop_price: float,
                 contingency: ContingencyType = ContingencyType.OCO,
                 order_list_id: str = "OL-001",
-                linked: list[str] | None = None):
+                linked: list[str] | None = None,
+                tags: list[str] | None = None):
     from nautilus_trader.model.orders import StopMarketOrder
     return StopMarketOrder(
         trader_id=TraderId("T-001"), strategy_id=StrategyId("S-001"),
@@ -96,6 +110,7 @@ def _stop_order(coid: str, side: OrderSide, stop_price: float,
         contingency_type=contingency,
         order_list_id=OrderListId(order_list_id),
         linked_order_ids=[ClientOrderId(c) for c in (linked or [])],
+        tags=tags,
     )
 
 
@@ -232,3 +247,284 @@ class TestPlaceOrderGroupFixture:
         )
         assert result["OrderGroupId"] == "GRP-001"
         assert len(result["Orders"]) == 2
+
+
+
+class TestIntentHelpers:
+    """Tests for intent_from_tags / equity_trade_action_from_intent."""
+
+    def test_intent_extracted_from_tags(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short", "TS_BRACKET:strat:O-E"])
+        assert intent_from_tags(o) == "close_short"
+
+    def test_no_tags_returns_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"])
+        assert intent_from_tags(o) is None
+
+    def test_unrelated_tags_return_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["SOMETHING_ELSE"])
+        assert intent_from_tags(o) is None
+
+    def test_close_short_buy_maps_to_buy_to_cover(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short"])
+        assert equity_trade_action_from_intent(o) == "BuyToCover"
+
+    def test_open_short_sell_maps_to_sell_short(self):
+        o = _market_order("O-ENTRY", OrderSide.SELL, ContingencyType.NO_CONTINGENCY,
+                          tags=["TS_INTENT:open_short"])
+        assert equity_trade_action_from_intent(o) == "SellShort"
+
+    def test_open_long_buy_maps_to_buy(self):
+        o = _market_order("O-ENTRY", OrderSide.BUY, ContingencyType.NO_CONTINGENCY,
+                          tags=["TS_INTENT:open_long"])
+        assert equity_trade_action_from_intent(o) == "Buy"
+
+    def test_close_long_sell_maps_to_sell(self):
+        o = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_long"])
+        assert equity_trade_action_from_intent(o) == "Sell"
+
+    def test_mismatched_intent_and_side_returns_none(self):
+        # close_short on a SELL order makes no sense — no mapping applied
+        o = _stop_order("O-SL", OrderSide.SELL, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:close_short"])
+        assert equity_trade_action_from_intent(o) is None
+
+    def test_open_intent_returns_none(self):
+        o = _stop_order("O-SL", OrderSide.BUY, 3300.0, linked=["O-TP"],
+                        tags=["TS_INTENT:open"])
+        assert equity_trade_action_from_intent(o) is None
+
+
+
+class TestEquityIntentInGroupPayloads:
+    """Equity group legs honor TS_INTENT tags (equity short-cover rejection class).
+
+    An equity short-cover leg must go out as BuyToCover; the plain converter
+    would send 'Buy' and TradeStation would reject it (the equity short-cover rejection).
+    Futures legs must keep plain Buy/Sell regardless of tags.
+    """
+
+    def _short_cover_oco_pair(self):
+        # Closing an equity SHORT: SL stop ABOVE entry + TP limit BELOW,
+        # both BUY legs tagged with the strategy's intent.
+        sl = _stop_order("O-SL", OrderSide.BUY, 460.0, ContingencyType.OCO,
+                         linked=["O-TP"], tags=["TS_INTENT:close_short"])
+        tp = _limit_order("O-TP", OrderSide.BUY, 430.0, ContingencyType.OCO,
+                          linked=["O-SL"], tags=["TS_INTENT:close_short"])
+        return [sl, tp]
+
+    def test_equity_short_cover_legs_use_buy_to_cover(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["BuyToCover", "BuyToCover"]
+
+    def test_futures_legs_keep_plain_buy_despite_intent_tags(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: False,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_no_predicate_keeps_previous_behavior(self):
+        # Default (no is_equity) must be byte-identical to today's payloads.
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_equity_long_close_legs_stay_sell(self):
+        sl = _stop_order("O-SL", OrderSide.SELL, 430.0, ContingencyType.OCO,
+                         linked=["O-TP"], tags=["TS_INTENT:close_long"])
+        tp = _limit_order("O-TP", OrderSide.SELL, 460.0, ContingencyType.OCO,
+                          linked=["O-SL"], tags=["TS_INTENT:close_long"])
+        _, payloads = convert_order_list_to_ts_group(
+            [sl, tp], _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Sell", "Sell"]
+
+    def test_untagged_equity_legs_keep_plain_action(self):
+        sl = _stop_order("O-SL", OrderSide.BUY, 460.0, ContingencyType.OCO,
+                         linked=["O-TP"])
+        tp = _limit_order("O-TP", OrderSide.BUY, 430.0, ContingencyType.OCO,
+                          linked=["O-SL"])
+        _, payloads = convert_order_list_to_ts_group(
+            [sl, tp], _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        assert [p["TradeAction"] for p in payloads] == ["Buy", "Buy"]
+
+    def test_prices_unaffected_by_intent_mapping(self):
+        _, payloads = convert_order_list_to_ts_group(
+            self._short_cover_oco_pair(), _ACCOUNT_ID, is_equity=lambda o: True,
+        )
+        stop_payload = next(p for p in payloads if p["OrderType"] == "StopMarket")
+        limit_payload = next(p for p in payloads if p["OrderType"] == "Limit")
+        assert float(stop_payload["StopPrice"]) == pytest.approx(460.0, rel=1e-4)
+        assert float(limit_payload["LimitPrice"]) == pytest.approx(430.0, rel=1e-4)
+
+
+# =============================================================================
+# place_order_group() — OrderConfirmId injection and dedup protocol (Group B)
+# =============================================================================
+
+def _mock_resp(status: int = 200, data: dict | list | None = None) -> MagicMock:
+    """Return a MagicMock that looks like an httpx Response."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = str(data or "")
+    resp.json.return_value = data if data is not None else {}
+    resp.headers = {}
+    return resp
+
+
+def _dedup_ack_body() -> dict:
+    """Return a TS duplicate-acknowledge response body for a group order."""
+    msg = "Order not placed because a unique orderconfirmid already exists."
+    return {"Orders": [{"Error": "FAILED", "Message": msg, "OrderID": ""}]}
+
+
+def _two_leg_orders(with_account_id: bool = True) -> list[dict]:
+    """Return a minimal 2-leg OCO order list."""
+    legs = [
+        {"Symbol": "GCJ26", "Quantity": "1", "OrderType": "StopMarket",
+         "TradeAction": "Sell", "TimeInForce": {"Duration": "GTC"}, "StopPrice": "3300.0"},
+        {"Symbol": "GCJ26", "Quantity": "1", "OrderType": "Limit",
+         "TradeAction": "Sell", "TimeInForce": {"Duration": "GTC"}, "LimitPrice": "3500.0"},
+    ]
+    if with_account_id:
+        for leg in legs:
+            leg["AccountID"] = "SIM0000001F"
+    return legs
+
+
+@pytest.fixture
+def http_client_for_groups():
+    """TradeStationHttpClient fixture pre-authenticated (no OAuth calls)."""
+    client = TradeStationHttpClient(
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        refresh_token="test_refresh_token",
+        use_sandbox=True,
+    )
+    client._access_token = "test_access_token"
+    # Naive utcnow to match the client's token-expiry convention (tz-aware
+    # modernization is a separate pass — upstream a716650 deliberately skipped).
+    client.token_expiry = datetime.utcnow() + timedelta(hours=1)
+    return client
+
+
+class TestPlaceOrderGroupConfirmId:
+    """place_order_group() injects per-leg OrderConfirmIds and handles all dedup paths."""
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_injects_confirm_id_per_leg(self, http_client_for_groups):
+        """Each leg in the POST body has a distinct 22-char hex OrderConfirmId."""
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["payload"] = json
+            return _mock_resp(200, {"OrderGroupId": "G-1", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]})
+
+        http_client_for_groups._httpx.post = mock_post
+        await http_client_for_groups.place_order_group("OCO", _two_leg_orders())
+
+        orders_in_payload = captured["payload"]["Orders"]
+        assert len(orders_in_payload) == 2
+        cids = [o["OrderConfirmId"] for o in orders_in_payload]
+        # Each must be 22 hex chars
+        for cid in cids:
+            assert len(cid) == 22
+            assert all(c in "0123456789abcdef" for c in cid)
+        # They must be distinct
+        assert cids[0] != cids[1]
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_uses_supplied_confirm_ids(self, http_client_for_groups):
+        """Caller-supplied order_confirm_ids are placed into each leg verbatim."""
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["payload"] = json
+            return _mock_resp(200, {"OrderGroupId": "G-2", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]})
+
+        http_client_for_groups._httpx.post = mock_post
+        await http_client_for_groups.place_order_group(
+            "OCO", _two_leg_orders(),
+            order_confirm_ids=["cid-1", "cid-2"],
+        )
+
+        orders_in_payload = captured["payload"]["Orders"]
+        assert orders_in_payload[0]["OrderConfirmId"] == "cid-1"
+        assert orders_in_payload[1]["OrderConfirmId"] == "cid-2"
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_normal_success_returns_response_as_is(self, http_client_for_groups):
+        """Normal 200 group success is returned unchanged."""
+        expected = {"OrderGroupId": "G-1", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]}
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, expected))
+
+        result = await http_client_for_groups.place_order_group("OCO", _two_leg_orders())
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_duplicate_ack_resolves_all_legs(self, http_client_for_groups):
+        """Dedup-ack: all legs are found in GET /orders; OrderGroupId preserved."""
+        cid_a, cid_b = "dedup-leg-a-cid-abcde", "dedup-leg-b-cid-abcde"
+
+        dedup_body = _dedup_ack_body()
+        get_orders_data = {
+            "Orders": [
+                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
+                {"OrderID": "real-B", "OrderConfirmId": cid_b, "OrderGroupId": "G-9"},
+            ]
+        }
+
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
+
+        result = await http_client_for_groups.place_order_group(
+            "OCO", _two_leg_orders(),
+            order_confirm_ids=[cid_a, cid_b],
+        )
+
+        assert result["OrderGroupId"] == "G-9"
+        assert len(result["Orders"]) == 2
+        order_ids = {o["OrderID"] for o in result["Orders"]}
+        assert order_ids == {"real-A", "real-B"}
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_duplicate_ack_partial_resolution_raises(self, http_client_for_groups):
+        """Dedup-ack with only 1 of 2 legs found → DuplicateOrderConfirmIdException."""
+        cid_a, cid_b = "found-cid-a-abcdefghij", "missing-cid-b-abcdefgh"
+
+        dedup_body = _dedup_ack_body()
+        # GET /orders returns only leg A
+        get_orders_data = {
+            "Orders": [
+                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
+            ]
+        }
+
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
+
+        with pytest.raises(DuplicateOrderConfirmIdException):
+            await http_client_for_groups.place_order_group(
+                "OCO", _two_leg_orders(),
+                order_confirm_ids=[cid_a, cid_b],
+            )
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_legs_missing_account_id_raises_OrderRejectedException(self, http_client_for_groups):
+        """Legs without AccountID on a dedup-ack → OrderRejectedException (not KeyError)."""
+        dedup_body = _dedup_ack_body()
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+
+        with pytest.raises(OrderRejectedException):
+            await http_client_for_groups.place_order_group(
+                "OCO", _two_leg_orders(with_account_id=False),
+            )

@@ -235,9 +235,9 @@ Example: `AAPL 250321C00175000` = AAPL call, expiry 2025-03-21, strike $175.00.
 EUR-denominated instruments (FDAX, FESX) require a EUR/USD exchange rate at startup.
 If the rate is not available, the kernel's portfolio initialization times out.
 
-**Fix in `run_paper_trading.py`:** `_inject_eur_usd_xrate()` fetches the EC contract
-close price and injects it as a mark rate. The kernel is also patched to start
-strategies regardless of portfolio initialization status.
+**Fix:** seed the EUR/USD rate before startup, for example by fetching the EC contract
+close price and injecting it as a mark rate in your own launcher script. Starting
+strategies regardless of portfolio initialization status is a host-application choice.
 
 ### Bars Never Arrive
 
